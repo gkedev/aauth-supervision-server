@@ -1,0 +1,24 @@
+name: Bug
+description: Something in the server, the policy, the CLI or the demo is broken.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: Commands, a policy or request sequence, or a failing test.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version, Python and OS
+      placeholder: "0.1.0, Python 3.13, Ubuntu 24.04"
+    validations:
+      required: true

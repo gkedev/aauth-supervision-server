@@ -1,0 +1,34 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software, please cite the paper it implements, as below.
+title: aauth-supervision-server
+abstract: >-
+  An independent Supervision Server for AAuth Supervision -00, with a deterministic,
+  composition-aware policy based on the Agentic Principal Chain from Bounded Agents.
+type: software
+authors:
+  - family-names: Muruaga
+    given-names: Xabier
+version: 0.1.0
+date-released: 2026-10-08
+license: Apache-2.0
+repository-code: https://github.com/xmuruaga/aauth-supervision-server
+keywords:
+  - aauth
+  - authorization
+  - ai-agents
+  - supervision
+  - ietf
+preferred-citation:
+  type: article
+  title: "Bounded Agents: Delegation Security for Multi-Agent AI Systems"
+  authors:
+    - family-names: Muruaga
+      given-names: Xabier
+  year: 2026
+  doi: 10.48550/arXiv.2608.15888
+  url: https://arxiv.org/abs/2608.15888
+  identifiers:
+    - type: other
+      value: "arXiv:2608.15888"
+      description: arXiv identifier

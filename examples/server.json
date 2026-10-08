@@ -1,0 +1,19 @@
+{
+  "issuer": "https://ss.example",
+  "name": "AAuth APC Supervisor",
+  "trusted_ps": {
+    "https://ps.example": {"auto_connect": false, "tenants": ["corp.example"]}
+  },
+  "open_registration": false,
+  "signature_window": 60,
+  "rate_limit_per_minute": 600,
+  "clarification_rounds": 3,
+  "clarification_timeout": 120,
+  "documentation_uri": "https://ss.example/docs",
+  "egress": {
+    "max_bytes": 262144,
+    "timeout": 5.0,
+    "allow_private_hosts": [],
+    "allow_cross_origin_jwks": false
+  }
+}

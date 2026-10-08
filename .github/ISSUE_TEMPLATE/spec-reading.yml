@@ -1,0 +1,32 @@
+name: Spec reading
+description: The server behaves in a way the pinned drafts do not support, or a draft is ambiguous here.
+labels: ["spec"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        For a problem in the AAuth drafts themselves, open an issue at
+        https://github.com/dickhardt/AAuth/issues instead. Security issues go through
+        private reporting (see SECURITY.md), never a public issue.
+  - type: input
+    id: draft
+    attributes:
+      label: Draft, line and section
+      description: The draft in specs/ (pinned to AAuth commit 70d67375), with line and section.
+      placeholder: "draft-hardt-aauth-supervision.md L316 (Idempotence)"
+    validations:
+      required: true
+  - type: textarea
+    id: quote
+    attributes:
+      label: The text
+      description: Quote the requirement exactly.
+    validations:
+      required: true
+  - type: textarea
+    id: behaviour
+    attributes:
+      label: What the server does, and how to reproduce it
+      description: A request sequence, a test, or `aauth-ss demo` output, and the expected result.
+    validations:
+      required: true

@@ -19,6 +19,6 @@ body:
     id: version
     attributes:
       label: Version, Python and OS
-      placeholder: "0.1.0, Python 3.13, Ubuntu 24.04"
+      placeholder: "0.2.0, Python 3.13, Ubuntu 24.04"
     validations:
       required: true

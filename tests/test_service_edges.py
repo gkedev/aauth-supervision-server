@@ -78,12 +78,22 @@ def test_health_is_get_only() -> None:
     assert get(ss, "/health", method="POST").status != 200
 
 
-def test_unknown_endpoint_is_404_invalid_request() -> None:
+def test_an_unknown_endpoint_is_a_plain_404_not_an_aauth_error_code() -> None:
+    # Supervision L631 pairs `invalid_request` with 400: a 404 must not carry it. A path
+    # the SS does not serve is no Supervision request, so it gets HTTP's own 404 with an
+    # RFC 9457 body and no AAuth `error` (the PS reads an unlisted status as
+    # `server_error`, L639, and treats the SS as unavailable, as for invalid_request).
     ss, ps, _ = make()
     r = ps.call(ss, "POST", "/nothing-here", {"x": 1})
-    assert r.status == 404 and r.json()["error"] == "invalid_request"
-    r = ps.call(ss, "PUT", "/pending/abc", {"x": 1})
-    assert r.status == 404
+    assert r.status == 404 and r.headers["Content-Type"] == "application/problem+json"
+    assert r.json() == {"type": "about:blank", "title": "Not Found", "status": 404}
+    # A resource the SS serves, with a method it does not: 405, naming those it does.
+    r = get(ss, "/pending/abc", method="HEAD")
+    assert r.status == 405 and r.headers["Allow"] == "GET, POST, DELETE"
+    assert r.json() == {"error": "invalid_request", "type": "about:blank",
+                        "title": "Method Not Allowed", "status": 405}
+    # A method the server implements nowhere: 501 (RFC 9110 9.1).
+    assert ps.call(ss, "PUT", "/pending/abc", {"x": 1}).status == 501
 
 
 def test_pending_poll_needs_no_body_but_a_post_does() -> None:
@@ -117,6 +127,19 @@ def test_rate_limit_of_one_and_minimum_retry_after() -> None:
     clock.t += 59.9
     r = ps.connect(ss, SUB)
     assert r.status == 429 and r.headers["Retry-After"] == "1"  # never 0
+
+
+def test_a_throttled_poll_is_slow_down_not_rate_limited() -> None:
+    """Supervision L639: "Polling a pending URL uses the polling error codes of the AAuth
+    Protocol", whose code for polling too often is `slow_down`, 429 (Protocol L2626).
+    `rate_limited` stays the answer on the other endpoints (Supervision L636)."""
+    ss, ps, clock = make(trust=TrustedPS(), rate_limit_per_minute=2)
+    loc = ps.connect(ss, SUB).headers["Location"]
+    assert ps.call(ss, "GET", loc).status == 202
+    r = ps.call(ss, "GET", loc)
+    assert r.status == 429 and r.json()["error"] == "slow_down"
+    assert r.headers["Retry-After"] == "60"
+    assert ps.connect(ss, SUB).json()["error"] == "rate_limited"
 
 
 def test_no_rate_limit_by_default() -> None:
@@ -182,6 +205,7 @@ def test_a_second_connect_reuses_the_open_pending() -> None:
     assert sum(1 for p in ss.store.pending.values() if p.kind == "connect") == 1
 
 
+@pytest.mark.req("REF-046")
 def test_pending_connect_response_shape() -> None:
     ss, ps, _ = make(trust=TrustedPS())
     r = _connect(ss, ps)
@@ -219,10 +243,12 @@ def test_interaction_confirms_a_pending_connect() -> None:
     assert done.status == 200 and done.body == b"Connected.\n"
     assert ss.store.connections[Store.k(ps.issuer, SUB)] == {
         "iss": ps.issuer, "sub": SUB, "tenant": None, "at": int(ps.clock())}
-    # The code is now used: neither the page nor a second confirmation accepts it.
-    assert get(ss, "/interaction", query=f"code={code}").status == 404
+    # The code is now used: neither the page nor a second confirmation accepts it
+    # (Protocol L2396: `invalid_code`, 410 per L2625).
+    used = get(ss, "/interaction", query=f"code={code}")
+    assert used.status == 410 and used.json()["error"] == "invalid_code"
     again = get(ss, "/interaction", method="POST", body=_form(code, "operator-secret"))
-    assert again.status == 404 and again.body == b"Unknown code.\n"
+    assert again.status == 410 and again.json()["error"] == "invalid_code"
 
 
 def test_interaction_refuses_without_the_operator_token() -> None:
@@ -235,15 +261,16 @@ def test_interaction_refuses_without_the_operator_token() -> None:
     assert Store.k(ps.issuer, SUB) not in ss.store.connections
 
 
-def test_interaction_locks_after_repeated_wrong_operator_tokens() -> None:
+def test_interaction_fails_a_connect_after_repeated_wrong_operator_tokens() -> None:
     ss, ps, _ = make(trust=TrustedPS())
     _connect(ss, ps)
     code = _pending_code(ss)
     for _ in range(MAX_OPERATOR_FAILURES):
         assert get(ss, "/interaction", method="POST", body=_form(code, "guess")).status == 403
-    # Locked: even the right token is refused now, so the token cannot be brute-forced.
-    locked = get(ss, "/interaction", method="POST", body=_form(code, "operator-secret"))
-    assert locked.status == 403 and locked.body.startswith(b"Locked")
+    # That connect failed for good: even the right token is refused for its code now, so
+    # the token cannot be guessed against it (Protocol L2398).
+    late = get(ss, "/interaction", method="POST", body=_form(code, "operator-secret"))
+    assert late.status == 410 and late.json()["error"] == "invalid_code"
     assert Store.k(ps.issuer, SUB) not in ss.store.connections
 
 
@@ -252,7 +279,7 @@ def test_a_correct_operator_token_resets_the_failure_count() -> None:
     _connect(ss, ps)
     for _ in range(MAX_OPERATOR_FAILURES - 1):
         get(ss, "/interaction", method="POST", body=_form("unknown", "guess"))
-    assert get(ss, "/interaction", method="POST", body=_form("unknown", "operator-secret")).status == 404
+    assert get(ss, "/interaction", method="POST", body=_form("unknown", "operator-secret")).status == 410
     for _ in range(MAX_OPERATOR_FAILURES - 1):
         get(ss, "/interaction", method="POST", body=_form("unknown", "guess"))
     done = get(ss, "/interaction", method="POST", body=_form(_pending_code(ss), "operator-secret"))
@@ -270,9 +297,12 @@ def test_interaction_with_no_operator_token_configured_refuses_everyone() -> Non
 def test_interaction_unknown_code_and_method() -> None:
     ss, _, _ = make()
     r = get(ss, "/interaction", query="code=NOPE")
-    assert r.status == 404 and r.body == b"Unknown or used code.\n"
+    # Protocol L2625: `invalid_code`, 410, "Interaction code not recognized or already
+    # consumed", in the Error Response Format.
+    assert r.status == 410 and r.json() == {"error": "invalid_code",
+                                            "detail": "unknown or used code"}
     r = get(ss, "/interaction", method="DELETE")
-    assert r.status == 405 and r.headers["Allow"] == "GET, POST"
+    assert r.status == 405 and r.headers["Allow"] == "GET, HEAD, POST"
 
 
 # -------------------------------------------------------------- config load
@@ -295,3 +325,57 @@ def test_server_config_trusted_ps_shapes() -> None:
                 {"extra": True}, []):
         with pytest.raises(ValueError, match="trusted_ps"):
             ServerConfig.from_dict(base | {"trusted_ps": {"https://ps.example": bad}})
+
+
+def test_posts_with_no_live_code_cannot_lock_the_interaction_page() -> None:
+    # The lock bounds guessing the operator token against connects awaiting confirmation:
+    # a post that names no live code is refused as such and never counts, so a client with
+    # no code cannot lock the page for the operator.
+    ss, ps, _ = make(trust=TrustedPS())
+    _connect(ss, ps)
+    for code in ("", "NOPE") * MAX_OPERATOR_FAILURES:
+        r = get(ss, "/interaction", method="POST", body=_form(code, "guess"))
+        assert r.status == 410 and r.json()["error"] == "invalid_code"
+    done = get(ss, "/interaction", method="POST", body=_form(_pending_code(ss), "operator-secret"))
+    assert done.status == 200 and done.body == b"Connected.\n"
+
+
+def test_wrong_tokens_against_one_connect_fail_that_connect_only() -> None:
+    # Protocol L2398: after a few failed attempts the pending interaction fails for good
+    # and its code is `invalid_code` from then on. Only that one: the page stays open for
+    # every other connect, so whoever holds one live code (any signer, under open
+    # registration) cannot stop the operator confirming the others.
+    ss, ps, _ = make(trust=TrustedPS())
+    first = _connect(ss, ps)
+    code = _pending_code(ss)
+    for _ in range(MAX_OPERATOR_FAILURES):
+        assert get(ss, "/interaction", method="POST", body=_form(code, "guess")).status == 403
+    late = get(ss, "/interaction", method="POST", body=_form(code, "operator-secret"))
+    assert late.status == 410 and late.json()["error"] == "invalid_code"
+    poll = ps.call(ss, "GET", first.headers["Location"])
+    assert poll.status == 403 and poll.json()["error"] == "denied"
+    other = "8f14e45fceea167a5a36dedd4bea2544"
+    ps.call(ss, "POST", "/connect", {"action": "connect", "id": ps.nid("c"),
+                                     "iat": int(ps.clock()), "sub": other})
+    code2 = next(p.code for p in ss.store.pending.values()
+                 if p.kind == "connect" and p.sub == other)
+    done = get(ss, "/interaction", method="POST", body=_form(code2, "operator-secret"))
+    assert done.status == 200 and done.body == b"Connected.\n"
+
+
+def test_wrong_tokens_against_a_connect_are_kept_with_its_record(tmp_path: Any) -> None:
+    # The count goes where the connect goes: dropped with its record, so codes that expire
+    # after a wrong token or two leave nothing behind, and kept in the snapshot with it,
+    # so a restart gives no one five more tries.
+    ss, ps, clock = make(trust=TrustedPS())
+    path = str(tmp_path / "ss.json")
+    ss.store = Store(path)
+    _connect(ss, ps)
+    code = _pending_code(ss)
+    for _ in range(MAX_OPERATOR_FAILURES - 1):
+        assert get(ss, "/interaction", method="POST", body=_form(code, "guess")).status == 403
+    ss.store.save()
+    again = SupervisionServer(ss.cfg, ss.policy, ss.resolver, ss.key, Store(path), clock=clock)
+    assert get(again, "/interaction", method="POST", body=_form(code, "guess")).status == 403
+    late = get(again, "/interaction", method="POST", body=_form(code, "operator-secret"))
+    assert late.status == 410 and late.json()["error"] == "invalid_code"

@@ -6,6 +6,7 @@
   },
   "open_registration": false,
   "signature_window": 60,
+  "transit_allowance": 2,
   "rate_limit_per_minute": 600,
   "clarification_rounds": 3,
   "clarification_timeout": 120,

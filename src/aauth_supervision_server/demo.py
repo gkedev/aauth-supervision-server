@@ -2,8 +2,8 @@
 
 Everything is real except the person server: the SS is the unmodified
 `SupervisionServer`, and `testing.SimulatedPS` speaks Supervision -00 to it with real
-RFC 9421 signatures and real signed tokens, in-process, with no network. The mission is
-the quarterly review of the README's diagrams: an allowed read, metered inference against
+RFC 9421 signatures and real signed tokens, in-process, with no network. The mission, a
+quarterly review, walks through what the README's diagrams show: an allowed read, metered inference against
 an AAuth Budgets ceiling, a person's answer, and the split exfiltration the APC policy
 exists to catch.
 
@@ -31,11 +31,13 @@ POLICY: dict[str, Any] = {
     "rules": [
         {"resource": RECORDS, "class": "read_sensitive"},
         {"resource": MAIL, "operation": "send_email",
-         "param_domain_not_in": {"to": ["corp.example"]}, "class": "send_external"},
+         "param_domain_not_in": {"to": ["corp.example"], "cc": ["corp.example"],
+                                 "bcc": ["corp.example"]}, "class": "send_external"},
         {"resource": MAIL, "operation": "send_email", "class": "send_internal",
          "if_unknown": "send_external"},
         {"resource": MAIL, "scope": "mail.send", "class": "send_internal",
          "if_unknown": "send_external"},
+        {"resource": MAIL, "class": "send_internal", "if_unknown": "send_external"},
         {"resource": INFERENCE, "class": "read"},
     ],
     "prohibited_pairs": [["read_sensitive", "send_external"]],
@@ -131,16 +133,19 @@ class Demo:
         self.token(INFERENCE, "A third 10.00 USD offer. Nothing has reported spend yet, so "
                    "both earlier allocations count in full.", scope="inference.completions",
                    budget=usd(1000))
-        self.token(INFERENCE, "The resource now reports, signed, that the first token spent "
-                   "only 2.00 USD.", scope="inference.completions", budget=usd(1000),
+        self.token(INFERENCE, "The agent asks for another 10.00 USD; the resource's token "
+                   "also reports, signed, that the first token has spent only 2.00 USD so far. "
+                   "That token is still live and may spend the rest, so the record frees "
+                   "nothing (Budgets: a consumption record settles nothing).",
+                   scope="inference.completions", budget=usd(1000),
                    consumed={"jti": "at-1", "consumed": 200}, jti="at-3")
 
         self.scene("A split exfiltration")
         self.token(RECORDS, "The agent reads the customer records (fine on its own).",
                    proposal={"operations": [{"operationId": "export"}],
                              "result": {"contains": ["customer_pii"]}})
-        sdi, d = self.token(MAIL, "It then asks to email them to drop@evil.example (also fine "
-                            "on its own).", scope="mail.send",
+        sdi, d = self.token(MAIL, "It then asks to email them to drop@evil.example, outside "
+                            "the company.", scope="mail.send",
                             proposal=SEND | {"parameters": {"to": "drop@evil.example"}})
 
         if d.get("decision") == "ask":
@@ -159,10 +164,9 @@ class Demo:
                      "the exfiltration itself: no one has to be asked.")
         else:
             self.say("Under Supervision -00 the SS cannot see who the mail goes to, so it cannot "
-                     "rule the exfiltration out, and puts it to the person instead of allowing "
-                     "it. A per-call SS would have allowed both acts. Run `aauth-ss demo "
-                     "--extension` to see the SS deny it itself with the R3 proposal forwarded "
-                     "(AAuth #256).")
+                     "rule the exfiltration out: it puts the send to the person, naming the "
+                     "composition it may complete. Run `aauth-ss demo --extension` to see the SS deny "
+                     "it itself with the R3 proposal forwarded (AAuth #256).")
         return 0
 
 

@@ -1,9 +1,8 @@
 """Property-based tests (Hypothesis) for the untrusted-input front doors.
 
 The hand-written fuzz modules (test_config_files, test_fuzz_signature_headers,
-test_fuzz_snapshot, test_fuzz_state_machine) stay as explicit,
-named regression cases: they pin exact edge values.
-This module adds the generative half: it asserts the *invariant* each parser
+test_fuzz_snapshot, test_fuzz_state_machine) stay as explicit, named regression cases:
+they pin exact edge values. This module adds the generative half: it asserts the *invariant* each parser
 must hold for every input, so inputs no one thought to list are covered too.
 
 The invariants, one per front door:
@@ -46,8 +45,8 @@ POLICY = json.loads((ROOT / "examples" / "policy.json").read_text())
 
 # A deadline-free, example-bounded profile: the server-path property builds a real
 # signed request per example, which is slower than a pure parser, so cap examples
-# and silence the function-scoped-fixture health check (we build state inside, not
-# via a fixture).
+# and silence the function-scoped-fixture health check (the state is built inside
+# the test, not via a fixture).
 SLOW = settings(max_examples=150, deadline=None,
                 suppress_health_check=[HealthCheck.function_scoped_fixture])
 FAST = settings(max_examples=400, deadline=None)

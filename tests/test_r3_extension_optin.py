@@ -52,10 +52,9 @@ def test_extension_off_ignores_the_member():
     # Spec-only: the unknown member is not parsed, so the mismatch is never seen and the
     # act is decided on the spec members alone (no resource-asserted operations).
     assert r.status == 200
-    assert r.json()["decision"] in ("allow", "ask", "deny", "clarify")
+    assert r.json()["decision"] == "ask"
     rec = ss.store.decisions[f"{ps.issuer}|d-x"]
-    assert rec is not None
-
+    assert rec.entry is not None and rec.entry.provenance == "configured"
 
 
 def test_forwarded_r3_document_gives_operations_but_no_parameters():

@@ -11,7 +11,7 @@ import json
 from typing import Any
 
 import pytest
-from conftest import AGENT, SUB, connected, make_env
+from conftest import AGENT, ROOT, SUB, connected, make_env
 
 from aauth_supervision_server.errors import ProtocolError
 from aauth_supervision_server.httpsig import verify_response
@@ -31,7 +31,7 @@ PAY_RULES = [{"resource": "*", "tool": "Pay", "param_gt": {"amount": 100}, "clas
 
 
 def with_rules(extra: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    base = json.loads((__import__("conftest").ROOT / "examples" / "policy.json").read_text())
+    base = json.loads((ROOT / "examples" / "policy.json").read_text())
     return base["rules"] + extra
 
 
@@ -105,7 +105,9 @@ def test_an_unexpected_failure_is_a_500_without_detail_leak() -> None:
     ss.policy = Boom()  # type: ignore[assignment]
     _, r, _ = ps.auth_token_request(ss, SUB, AGENT, s256, MAIL)
     assert r.status == 500
-    assert r.json() == {"error": "server_error", "detail": "RuntimeError"}
+    # Nothing of the failure reaches the caller, not even its class: the operator's log
+    # has the traceback.
+    assert r.json() == {"error": "server_error"}
 
 
 def test_mission_url_with_an_extra_segment_is_not_the_mission() -> None:
@@ -191,8 +193,11 @@ def test_clarification_round_limit_zero_asks_at_once() -> None:
     ss.cfg.clarification_rounds = 0
     _, r, _ = ps.auth_token_request(ss, SUB, AGENT, s256, MAIL, scope="mail.send")
     assert r.status == 200 and r.json()["decision"] == "ask"
-    assert r.json()["summary"] == ("The agent did not resolve the supervisor's question within "
-                                   "the round limit.")
+    # No question was put to the agent: the person is told the policy's own reasons, with
+    # the reaches it offers, and nothing about a round limit.
+    assert r.json()["summary"] == ("This may be a `send_external` act, and the supervisor has "
+                                   "no detail of it from the resource.")
+    assert [o["value"] for o in r.json()["apply_options"]] == ["once", "mission", "always"]
 
 
 def test_first_clarification_is_round_one() -> None:
@@ -209,7 +214,7 @@ def test_an_answered_clarification_is_terminal_and_quotes_the_agent() -> None:
     a = ps.call(ss, "POST", r.headers["Location"], {
         "action": "clarification_response", "clarification_response": "to notify the team"})
     assert a.status == 200 and a.json()["decision"] == "ask"  # not another clarify
-    assert a.json()["summary"].endswith("; the agent says: to notify the team.")
+    assert a.json()["summary"].endswith("; the agent says: `to notify the team`.")
 
 
 def test_updated_request_carries_the_forwarded_proposal() -> None:
@@ -323,7 +328,7 @@ def test_a_mission_proposal_ask_carries_the_summary() -> None:
                                          "agent_token": ps.agent_token(AGENT), "description": "x",
                                          "tools": [{"name": "DeleteRepo"}], "resources": []})
     assert r.json()["decision"] == "ask"
-    assert r.json()["summary"].startswith("The mission asks for tools that need your approval")
+    assert r.json()["summary"].startswith("The proposed refinement leaves out tools that need your approval")
 
 
 def _update(ps: Any, ss: Any, s256: str) -> Any:
@@ -336,7 +341,7 @@ def test_mission_update_is_recorded_when_allowed() -> None:
     ss, ps, c = make_env()
     s256 = connected((ss, ps, c))
     assert _update(ps, ss, s256).json()["decision"] == "allow"
-    assert ss.store.missions[Store.k(ps.issuer, s256)].blob["_updates"] == ["also file the report"]
+    assert ss.store.missions[Store.k(ps.issuer, s256)].updates == ["also file the report"]
 
 
 def test_mission_update_is_asked_when_configured_and_not_recorded() -> None:
@@ -344,8 +349,9 @@ def test_mission_update_is_asked_when_configured_and_not_recorded() -> None:
     s256 = connected((ss, ps, c))
     r = _update(ps, ss, s256).json()
     assert r["decision"] == "ask"
-    assert r["summary"] == "The agent reports a change to the mission: also file the report"
-    assert "_updates" not in ss.store.missions[Store.k(ps.issuer, s256)].blob
+    assert r["summary"] == ("The agent reports a change to the mission:\n\n"
+                            "```\nalso file the report\n```")
+    assert ss.store.missions[Store.k(ps.issuer, s256)].updates == []
 
 
 # --------------------------------------------------------- permission acts
@@ -368,7 +374,7 @@ def test_an_allowed_permission_is_history_at_once_and_only_then() -> None:
     assert [h.sdi for h in history(ss, ps, s256)] == [sdi]
     _, asked = permission(ps, ss, s256, "ReadFile")  # not an approved tool: asked
     assert asked.json()["decision"] == "ask"
-    _, at = ps.auth_token_request(ss, SUB, AGENT, s256, MAIL)[:2]
+    ps.auth_token_request(ss, SUB, AGENT, s256, MAIL)
     assert [h.sdi for h in history(ss, ps, s256)] == [sdi]  # auth_token waits for issuance
 
 
@@ -455,11 +461,17 @@ def test_audit_record_is_agent_evidence_in_the_mission_history() -> None:
     assert (w.action_class, w.amount) == ("read", 0)
 
 
-def test_revocation_is_recorded_by_issuer_and_jti() -> None:
+def test_a_revocation_is_acknowledged_and_not_kept(tmp_path: Any) -> None:
+    # The SS "has no part in the cascade" (Supervision L545) and nothing it decides reads
+    # a revocation, so keeping every revoked token id would only grow the state.
     ss, ps, c = make_env()
+    ss.store = Store(str(tmp_path / "ss.json"))
     connected((ss, ps, c))
-    event(ps, ss, "revocation.received", iss="https://as.example", jti="t-1")
-    assert Store.k("https://as.example", "t-1") in ss.store.revoked
+    r = event(ps, ss, "revocation.received", token_type="agent", iss="https://as.example",
+              jti="t-1", exp=int(c()) + 60)
+    assert r.status == 201
+    assert "revoked" not in json.loads((tmp_path / "ss.json").read_text(encoding="utf-8"))
+    assert not hasattr(ss.store, "revoked")
 
 
 def test_agent_bound_records_the_binding() -> None:
@@ -468,7 +480,6 @@ def test_agent_bound_records_the_binding() -> None:
     event(ps, ss, "agent.bound", agent_iss="https://agent.example", agent_sub="s-1")
     rec = ss.store.agents[Store.k(ps.issuer, SUB, AGENT)]
     assert rec == {"agent_iss": "https://agent.example", "agent_sub": "s-1", "at": int(ps.clock())}
-
 
 
 # ------------------------------------------------------- remaining edges
@@ -521,7 +532,6 @@ def test_an_action_on_a_terminated_mission_is_denied_with_the_reason() -> None:
                                                     "reason": "done"}).status == 201
     r = _update(ps, ss, s256).json()
     assert r["decision"] == "deny" and r["reason"] == "The mission has terminated."
-
 
 
 # ------------------------------------------------------- server identifiers

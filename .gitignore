@@ -12,5 +12,3 @@ build/
 dist/
 /keys/
 /state/
-evals/results/*.tmp
-.work/

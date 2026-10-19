@@ -1,14 +1,13 @@
 """The service paths no other suite reaches, each pinned to its observable effect.
 
-Coverage of `service.py` was 96% before this module; the rest were real paths
-(malformed bodies, unsigned operation, Accept-Signature fallbacks, policy answers with
-no optional members, R3 decoding errors, late and repeated pending operations, the
-events the SS only acknowledges). Three of them hid defects, fixed alongside:
+Malformed bodies, unsigned operation, Accept-Signature fallbacks, policy answers with no
+optional members, R3 decoding errors, late and repeated pending operations, the events
+the SS only acknowledges. Among them:
 
-* a non-UTF-8 R3 proposal escaped the JSON error handling and was answered 500;
-* the clarification `timeout` the SS states was never enforced (SUP-P15);
-* a DELETE after a clarification was answered rewrote the answer to `abandoned`, so
-  the person's later `decision.resolved` was dropped (SUP-P17).
+* a non-UTF-8 R3 proposal is a 400, never a 500;
+* the clarification `timeout` the SS states is enforced (SUP-P15);
+* a DELETE after a clarification was answered leaves the answer, so the person's later
+  `decision.resolved` still counts (SUP-P17).
 """
 from __future__ import annotations
 
@@ -118,7 +117,7 @@ def test_a_forwarded_token_whose_payload_is_not_json(payload: str) -> None:
 @pytest.mark.parametrize("body,ctype,detail", [
     (b'{"action":"connect"}', "text/plain", "body must be application/json"),
     (b"{", "application/json", "body is not JSON"),
-    (b"\xff\xfe", "application/json", "body is not JSON"),
+    (b"\xff\xfe", "application/json", "body must be UTF-8 JSON with no byte order mark"),
     (b"[1]", "application/json", "body is not a JSON object"),
 ])
 def test_a_signed_body_that_is_not_a_json_object_is_refused(body: bytes, ctype: str,
@@ -164,6 +163,21 @@ def test_unusable_accept_signature_falls_back_to_the_default(accept: str) -> Non
     assert r.status == 200
     assert r.headers["Signature-Input"].startswith(
         'sig=("@status" "content-type" "content-digest" "content-digest";req')
+
+
+def test_a_requested_component_that_cannot_be_covered_keeps_the_request_binding() -> None:
+    # RFC 9421 Section 5.2: a requested component that does not apply fails that request.
+    # The answer is still signed (Supervision L320), and over the `;req` components L340
+    # says it SHOULD cover: one bad component does not drop them all, so the signed
+    # decision stays bound to the request it answers.
+    ss, ps, _ = make_env()
+    req = ps.build("POST", "/connect", {"action": "connect", "id": "c-1", "iat": 1, "sub": SUB})
+    req.headers["accept-signature"] = 'sig=("@status" "@unknown-derived";req)'
+    r = ss.handle(req)
+    assert r.status == 200
+    assert r.headers["Signature-Input"].startswith(
+        'sig=("@status" "content-type" "content-digest" "content-digest";req '
+        '"@authority";req "@path";req);')
 
 
 def test_a_stored_answer_without_a_body_is_redelivered_as_is() -> None:
@@ -226,7 +240,8 @@ def test_a_proposal_ask_without_a_refinement_carries_no_proposed() -> None:
     ps.connect(ss, SUB)
     ss.policy = Scripted(ss.policy, proposal=Decision("ask", summary="Check with me."))
     assert propose(ss, ps).json() == {"sdi": ps.sent[-1][1]["sdi"], "decision": "ask",
-                                      "summary": "Check with me."}
+                                      "summary": "Check with me.",
+                                      "apply_options": [{"value": "once", "label": "This proposal only"}]}
 
 
 def test_a_proposal_deny_without_a_reason_carries_no_reason() -> None:
@@ -272,7 +287,7 @@ def test_a_retried_mission_update_gets_the_same_signed_answer() -> None:
     second = ps.call(ss, "POST", f"/mission/{s256}", body)
     assert first.status == second.status == 200
     assert (first.body, first.headers["Signature"]) == (second.body, second.headers["Signature"])
-    assert ss.store.missions[Store.k(ps.issuer, s256)].blob["_updates"] == [
+    assert ss.store.missions[Store.k(ps.issuer, s256)].updates == [
         "Also draft the summary"]
 
 
@@ -289,7 +304,7 @@ def r3_request(ps: Any, ss: Any, s256: str, member: Any, r3_s256: str = "") -> A
 
 @pytest.mark.parametrize("member,detail", [
     ("a=b", "R3 proposal is not base64url"),
-    (b64u(b"\xff\xfe\x00"), "R3 proposal is not JSON"),  # was a 500: UnicodeDecodeError
+    (b64u(b"\xff\xfe\x00"), "R3 proposal is not JSON"),  # not UTF-8: a 400, never a 500
     (b64u(b"{"), "R3 proposal is not JSON"),
     (b64u(b"[1]"), "R3 proposal is not an object"),
 ])
@@ -342,8 +357,9 @@ def test_clarification_times_out_at_the_stated_timeout() -> None:
                                      "clarification_response": "late"})
     assert late.status == 408 and late.json() == {
         "error": "expired", "detail": "the clarification was not answered in time"}
-    assert ps.call(ss, "GET", loc).status == 408
-    assert ps.call(ss, "DELETE", loc).status == 408
+    # The 408 is a terminal response (Protocol L2414), so the URL is gone after it (L2840).
+    assert ps.call(ss, "GET", loc).status == 410
+    assert ps.call(ss, "DELETE", loc).status == 410
     assert ss.store.decisions[Store.k(ps.issuer, sdi)].decision == "expired"
 
 
@@ -363,12 +379,15 @@ def test_each_clarification_round_gets_the_full_timeout() -> None:
 @pytest.mark.req("SUP-P15")
 def test_an_answered_clarification_does_not_expire() -> None:
     ss, ps, clock, s256 = clarify_env()
-    _, loc = ask_clarification(ss, ps, s256)
+    sdi, loc = ask_clarification(ss, ps, s256)
     a = ps.call(ss, "POST", loc, {"action": "clarification_response",
                                   "clarification_response": "why"})
     clock.t += 10_000
+    # Gone, not expired: the answer was the terminal response (Protocol L2840), and the
+    # decision on file stays the answer.
     g = ps.call(ss, "GET", loc)
-    assert g.status == 200 and g.body == a.body
+    assert g.status == 410
+    assert ss.store.decisions[Store.k(ps.issuer, sdi)].decision == a.json()["decision"]
 
 
 @pytest.mark.req("SUP-P15")
@@ -381,7 +400,7 @@ def test_a_zero_timeout_is_neither_stated_nor_enforced() -> None:
     assert g.status == 202 and "timeout" not in g.json()
 
 
-def test_a_snapshot_pending_without_a_deadline_never_expires(tmp_path: Any) -> None:
+def test_a_snapshot_pending_without_a_deadline_never_expires() -> None:
     ss, ps, clock, s256 = clarify_env()
     _, loc = ask_clarification(ss, ps, s256)
     ss.store.pending[loc.rsplit("/", 1)[1]].deadline = 0.0  # as loaded from a snapshot that has no deadline
@@ -399,23 +418,28 @@ def test_a_delete_after_the_answer_keeps_the_answer() -> None:
     a = ps.call(ss, "POST", loc, {"action": "clarification_response",
                                   "clarification_response": "to tell the team"})
     assert a.json()["decision"] == "ask"
-    assert ps.call(ss, "DELETE", loc).status == 204
+    # Protocol L2840: the answer was the terminal response, so a late DELETE finds the URL
+    # gone and changes nothing.
+    assert ps.call(ss, "DELETE", loc).status == 410
     assert ps.call(ss, "GET", loc).status == 410
     rec = ss.store.decisions[Store.k(ps.issuer, sdi)]
     assert rec.decision == "ask"
-    # The person's answer still counts (it was dropped when DELETE rewrote the record).
+    # The person's answer still counts: the late DELETE did not rewrite the record.
     assert ps.resolved(ss, SUB, AGENT, s256, sdi, "allow", apply="mission").status == 201
     assert rec.decision == "resolved_allow"
 
 
-@pytest.mark.req("SUP-P17")
-def test_a_retry_after_withdrawal_points_at_the_withdrawn_request() -> None:
+@pytest.mark.req("SUP-P17", "REF-010")
+def test_a_retry_after_withdrawal_is_decided_afresh() -> None:
+    # The withdrawn question answered nothing: a retry of the request under its sdi is
+    # decided again (here, asked again, at a new URL); the withdrawn URL stays gone.
     ss, ps, _, s256 = clarify_env()
     _, loc = ask_clarification(ss, ps, s256)
     body = ps.sent[-1][1]
     assert ps.call(ss, "DELETE", loc).status == 204
     again = ps.call(ss, "POST", "/decision", body)
-    assert again.status == 202 and again.headers["Location"] == loc
+    assert again.status == 202 and again.headers["Location"] != loc
+    assert ps.call(ss, "GET", again.headers["Location"]).status == 202
     assert ps.call(ss, "GET", loc).status == 410
 
 
@@ -551,3 +575,27 @@ def test_offered_reaches_read_only_well_formed_options() -> None:
     assert offered(ss, ps, "[1]") == {"once"}
     assert offered(ss, ps, json.dumps({"apply_options": [
         "always", {"value": 3}, {"label": "x"}, {"value": "mission"}]})) == {"once", "mission"}
+
+
+@pytest.mark.req("REF-027")
+@pytest.mark.parametrize("uri", ["http://ss.example/docs", "javascript:alert(1)", "docs",
+                                 "https://", "https://[ss.example/docs"])
+def test_documentation_uri_must_be_an_https_url(uri: str) -> None:
+    # Protocol L1994: `documentation_uri` "URL with developer documentation. MUST use
+    # `https`." The SS publishes it in its metadata as configured.
+    with pytest.raises(ValueError, match="documentation_uri"):
+        ServerConfig.from_dict({"issuer": "https://ss.example", "documentation_uri": uri})
+    ok = ServerConfig.from_dict({"issuer": "https://ss.example",
+                                 "documentation_uri": "https://ss.example/docs"})
+    assert ok.documentation_uri == "https://ss.example/docs"
+
+
+@pytest.mark.parametrize("tool", [{"description": "no name"}, "WebSearch", 5])
+def test_a_proposal_tool_entry_without_a_name_is_not_a_tool_name(tool: Any) -> None:
+    # Only a tool object's `name` is checked as a name; the entry itself is the policy's.
+    ss, ps, clock = make_env()
+    ps.connect(ss, SUB)
+    r = ps.call(ss, "POST", "/mission", {"sdi": ps.nid("d"), "iat": int(clock()), "sub": SUB,
+                                         "agent": AGENT, "agent_token": ps.agent_token(AGENT),
+                                         "description": "x", "resources": [], "tools": [tool]})
+    assert r.status == 200

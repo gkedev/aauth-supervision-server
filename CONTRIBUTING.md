@@ -25,13 +25,14 @@ is exactly what CI runs on Linux, macOS and Windows:
 python tools/check.py      # inside the activated .venv, on any OS
 ```
 
-The auth-go interop tests need a Go toolchain (1.26 or later) on `PATH`; without one
-they skip locally. CI installs Go and sets `AAUTH_SS_REQUIRE_GO=1`, so there they always
+The aauth-go interop tests need a Go toolchain (1.26 or later) on `PATH` and its modules,
+fetched once with `(cd interop/aauth-go && go mod download)`: the gate is offline only
+after that. Without a toolchain they skip locally. CI installs Go and sets `AAUTH_SS_REQUIRE_GO=1`, so there they always
 run. Set it yourself to make a missing toolchain fail rather than skip.
 
 A change is ready when the gate is green end to end:
 
-- **ruff** and **mypy** (strict typing of `src/`) are clean.
+- **ruff** and **mypy** (`disallow_untyped_defs` over `src/`) are clean.
 - The suite passes under **100% line and branch coverage** of `src/`
   (`fail_under = 100`, no inline `pragma: no cover`). New code comes with the tests
   that cover it.

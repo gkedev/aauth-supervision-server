@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime
+
 import pytest
 from conftest import AGENT, SUB, connected, make_env
 
 from aauth_supervision_server.httpsig import HttpRequest, content_digest, sign_message
-from aauth_supervision_server.jwk import b64u
+from aauth_supervision_server.jwk import b64u, b64u_decode
 from aauth_supervision_server.service import TrustedPS
 from aauth_supervision_server.testing import make_jwt, r3_bytes
 
@@ -18,7 +21,7 @@ def _decision(ps, ss, **body):
     return ps.call(ss, "POST", "/decision", base | body)
 
 
-@pytest.mark.req("SUP-011")
+@pytest.mark.req("SUP-011", "VER-010")
 def test_body_signature_must_cover_content_digest(env):
     ss, ps, clock = env
     ps.connect(ss, SUB)
@@ -34,7 +37,50 @@ def test_body_signature_must_cover_content_digest(env):
     assert r.status == 401 and "Signature-Error" in r.headers
 
 
-@pytest.mark.req("SUP-012", "SUP-013", "SUP-014", "SUP-015", "SUP-016", "SUP-032")
+@pytest.mark.req("SUP-011", "VER-010")
+def test_body_signature_must_cover_content_type(env):
+    ss, ps, clock = env
+    ps.connect(ss, SUB)
+    raw = b'{"action":"connect","id":"c-1","iat":1,"sub":"x"}'
+    req = HttpRequest("POST", "ss.example", "/connect",
+                      {"content-type": "application/json", "content-digest": content_digest(raw)},
+                      raw)
+    sk = f'sig=jwks_uri;id="{ps.issuer}";dwk="aauth-person.json";kid="{ps.key.kid}"'
+    h = sign_message(["@method", "@authority", "@path", "signature-key", "content-digest"],
+                     ps.key, sk, req, created=int(clock()))
+    req.headers.update({k.lower(): v for k, v in h.items()})
+    r = ss.handle(req)
+    assert r.status == 401 and "Signature-Error" in r.headers
+
+
+@pytest.mark.req("SUP-026")
+def test_mission_answers_echo_the_sdi(env):
+    ss, ps, clock = env
+    ps.connect(ss, SUB)
+    r = ps.call(ss, "POST", "/mission", {"sdi": "d-prop", "iat": int(clock()), "sub": SUB,
+                                         "agent": AGENT, "agent_token": ps.agent_token(AGENT),
+                                         "description": "x", "resources": []})
+    assert r.json()["sdi"] == "d-prop"
+    s256 = connected(env)
+    for action, member in (("update", "description"), ("completion", "summary")):
+        r = ps.call(ss, "POST", f"/mission/{s256}", {"action": action, "sdi": f"d-{action}",
+                                                     "iat": int(clock()), "sub": SUB,
+                                                     "agent": AGENT, member: "x"})
+        assert r.json()["sdi"] == f"d-{action}"
+
+
+@pytest.mark.req("SUP-P02")
+def test_a_repeated_event_records_nothing_new(env):
+    ss, ps, clock = env
+    s256 = connected(env)
+    ev = {"event": "audit.recorded", "id": "e-dup", "iat": int(clock()), "sub": SUB,
+          "agent": AGENT, "mission_s256": s256, "action": "Export", "parameters": {}}
+    for _ in range(3):
+        assert ps.call(ss, "POST", "/event", ev).status == 201
+    assert len(ss.store.missions[f"{ps.issuer}|{s256}"].history) == 1
+
+
+@pytest.mark.req("SUP-012", "SUP-013", "SUP-014", "SUP-015", "SUP-016", "SUP-032", "REF-050")
 @pytest.mark.parametrize("missing", ["iat", "sub", "agent", "agent_token", "description"])
 def test_proposal_required_members(env, missing):
     ss, ps, _ = env
@@ -56,12 +102,72 @@ def test_event_required_members(env, missing):
     assert ps.call(ss, "POST", "/event", body).status == 400
 
 
+IAT_NUMBER = "member 'iat' must be a finite JSON number of at most 2**53 - 1 either way"
+IAT_TYPE = "member 'iat' has the wrong JSON type"
+
+
+def _signed_raw(ss, ps, clock, path, raw):
+    """`raw` sent as written, signed: a number in a form `json.dumps` never writes (an
+    exponent, NaN, Infinity) reaches the SS as such."""
+    req = HttpRequest("POST", "ss.example", path,
+                      {"content-type": "application/json", "content-digest": content_digest(raw)},
+                      raw)
+    sk = f'sig=jwks_uri;id="{ps.issuer}";dwk="aauth-person.json";kid="{ps.key.kid}"'
+    h = sign_message(["@method", "@authority", "@path", "signature-key", "content-digest",
+                      "content-type"], ps.key, sk, req, created=int(clock()))
+    req.headers.update({k.lower(): v for k, v in h.items()})
+    return ss.handle(req)
+
+
 @pytest.mark.req("SUP-014")
-def test_iat_must_be_integer(env):
+@pytest.mark.parametrize("iat, detail", [
+    ("now", IAT_TYPE), ("1790600000", IAT_TYPE), (True, IAT_TYPE), (False, IAT_TYPE),
+    ([1], IAT_TYPE), ({"s": 1}, IAT_TYPE), (None, "missing member(s): iat"),
+    (2.0 ** 60, IAT_NUMBER), (2 ** 60, IAT_NUMBER), (2 ** 53, IAT_NUMBER),
+    (-(2 ** 53), IAT_NUMBER), (10 ** 400, IAT_NUMBER), (float("nan"), IAT_NUMBER),
+    (float("inf"), IAT_NUMBER), (float("-inf"), IAT_NUMBER)])
+def test_an_iat_that_is_not_a_finite_number_of_seconds_is_refused_here(env, iat, detail):
+    # L198 gives `iat` as "seconds since the epoch" and says no more: any JSON number is
+    # seconds, a fraction too (`tests/test_iat_seconds.py`). One no JSON parser holds
+    # exactly (past 2**53 - 1 either way, I-JSON), NaN and the infinities (no JSON numbers,
+    # which Python's reader takes all the same), and anything not a number are refused,
+    # and the refusal says which.
     ss, ps, _ = env
     ps.connect(ss, SUB)
-    r = ps.call(ss, "POST", "/connect", {"action": "connect", "id": "c", "iat": "now", "sub": SUB})
-    assert r.status == 400
+    r = ps.call(ss, "POST", "/connect", {"action": "connect", "id": "c", "iat": iat, "sub": SUB})
+    assert (r.status, r.json()["error"], r.json()["detail"]) == (400, "invalid_request", detail)
+
+
+@pytest.mark.req("SUP-014")
+@pytest.mark.parametrize("written", [b"NaN", b"Infinity", b"-Infinity", b"1e400", b"-1e400",
+                                     b"9007199254740992", b"-9007199254740992",
+                                     b"9.007199254740992e15"])
+def test_an_iat_written_as_no_finite_time_is_refused_here(env, written):
+    ss, ps, clock = env
+    raw = b'{"action":"connect","id":"c","iat":' + written + b',"sub":"' + SUB.encode() + b'"}'
+    r = _signed_raw(ss, ps, clock, "/connect", raw)
+    assert r.status == 400 and json.loads(r.body)["detail"] == IAT_NUMBER
+    assert f"{ps.issuer}|{SUB}" not in ss.store.connections
+
+
+@pytest.mark.req("SUP-014")
+@pytest.mark.parametrize("written, read", [
+    (b"1.7906e9", 1790600000), (b"17906E5", 1790600000), (b"1790600000e0", 1790600000),
+    (b"1.7906000009e9", 1790600000), (b"1790600000.0", 1790600000),
+    (b"9.007199254740991E15", 2 ** 53 - 1)])
+def test_an_iat_written_with_an_exponent_is_read_as_its_number(env, written, read):
+    # A number of seconds written with an exponent or a decimal point is a JSON number all
+    # the same (RFC 8259 Section 6): sent as written, signed, taken, and read as the whole
+    # second it falls in.
+    ss, ps, clock = env
+    raw = b'{"action":"connect","id":"c","iat":' + written + b',"sub":"' + SUB.encode() + b'"}'
+    r = _signed_raw(ss, ps, clock, "/connect", raw)
+    assert r.status == 200 and json.loads(r.body) == {"status": "connected"}
+    raw = (b'{"event":"audit.recorded","id":"e-1","iat":' + written + b',"sub":"'
+           + SUB.encode() + b'","agent":"' + AGENT.encode() + b'","action":"WebSearch"}')
+    assert _signed_raw(ss, ps, clock, "/event", raw).status == 201
+    (h,) = ss.store.history_for(ps.issuer, SUB, AGENT, "")
+    assert h.iat == read and type(h.iat) is int
 
 
 @pytest.mark.req("SUP-017", "SUP-P09")
@@ -101,20 +207,84 @@ def test_connect_page_shows_issuer_name_and_code():
     assert code.encode() in page
 
 
-@pytest.mark.req("SUP-023", "SUP-045", "SUP-049")
+@pytest.mark.req("SUP-023", "SUP-049")
 def test_allow_narrows_exp_to_mission_expiry(env):
-    ss, ps, _ = env
+    ss, ps, clock = env
     s256 = connected(env, resources=(HR, MAIL, CAL))
-    exp = ss.store.missions[f"{ps.issuer}|{s256}"].blob["expires_at"]
+    from aauth_supervision_server.policy import _iso_to_epoch
+    from aauth_supervision_server.store import Store
+
+    blob = ss.store.missions[f"{ps.issuer}|{s256}"].blob
+    # A mission ending within the hour: its expiry is earlier than the auth-token cap
+    # (decision + one hour, Supervision L508), so both acts carry the mission's.
+    far = int(_iso_to_epoch(blob["expires_at"]))
+    assert far > int(clock()) + Store.OPEN_ISSUANCE
+    blob["expires_at"] = datetime.fromtimestamp(int(clock()) + 600, UTC).isoformat().replace(
+        "+00:00", "Z")
+    exp = blob["expires_at"]
     _, r, _ = ps.auth_token_request(ss, SUB, AGENT, s256, CAL)
     d = r.json()
     assert d["decision"] == "allow" and isinstance(d["exp"], int)
-    from aauth_supervision_server.policy import _iso_to_epoch
 
     assert d["exp"] == int(_iso_to_epoch(exp))
     pt = _decision(ps, ss, act="person_token", mission_s256=s256, resource=HR,
                    agent_token=ps.agent_token(AGENT))
     assert pt.json()["exp"] == d["exp"]
+
+
+@pytest.mark.req("SUP-P09")
+def test_a_permission_allow_carries_no_exp(env):
+    """Supervision defines `exp` on the allow of a person token (L485) and an auth token
+    (L508); a permission allow becomes `permission: granted` (L531), which has no
+    lifetime, and this SS counts a grant as never expiring. So it sends no `exp` there,
+    even in a mission with an `expires_at`."""
+    ss, ps, clock = env
+    s256 = connected(env, tools=[{"name": "Export", "description": "Export a file"}])
+    assert "expires_at" in ss.store.missions[f"{ps.issuer}|{s256}"].blob
+    r = _decision(ps, ss, act="permission", mission_s256=s256, action="Export")
+    assert r.json()["decision"] == "allow" and "exp" not in r.json()
+
+
+def _with_typ(token: str, typ: str) -> str:
+    """The same token with another `typ` header (the SS reads forwarded tokens, it does
+    not verify their signatures: the PS did)."""
+    head = json.loads(b64u_decode(token.split(".")[0])) | {"typ": typ}
+    return b64u(json.dumps(head).encode()) + "." + token.split(".", 1)[1]
+
+
+@pytest.mark.parametrize("typ,status", [
+    ("aa-resource+jwt", 200), ("application/aa-resource+jwt", 200), ("AA-Resource+JWT", 200),
+    ("aa-auth+jwt", 400), ("aa-person+jwt", 400), ("JWT", 400), (None, 400)])
+def test_a_forwarded_resource_token_is_read_only_with_its_typ(env, typ, status):
+    """Protocol L2896: implementations "MUST check `typ` before acting on any AAuth JWT".
+    The SS acts on the resource token's claims, so it checks the header is a resource
+    token's, compared as RFC 7515 Section 4.1.9 compares a media type (case-insensitive,
+    `application/` implied)."""
+    ss, ps, _ = env
+    s256 = connected(env)
+    rt = ps.resource_token(CAL, mission_s256=s256)
+    if typ is None:
+        head = json.loads(b64u_decode(rt.split(".")[0]))
+        del head["typ"]
+        rt = b64u(json.dumps(head).encode()) + "." + rt.split(".", 1)[1]
+    else:
+        rt = _with_typ(rt, typ)
+    r = _decision(ps, ss, act="auth_token", mission_s256=s256, agent_token=ps.agent_token(AGENT),
+                  resource_token=rt, presented_token="a.b.c")
+    assert r.status == status, r.json()
+    if status == 400:
+        assert r.json()["error"] == "invalid_request"
+
+
+@pytest.mark.parametrize("header", [b"[1]", b'"aa-resource+jwt"', b"{", b"\xff"])
+def test_a_forwarded_resource_token_whose_header_is_not_an_object_is_refused(env, header):
+    ss, ps, _ = env
+    s256 = connected(env)
+    rt = ps.resource_token(CAL, mission_s256=s256)
+    rt = b64u(header) + "." + rt.split(".", 1)[1]
+    r = _decision(ps, ss, act="auth_token", mission_s256=s256, agent_token=ps.agent_token(AGENT),
+                  resource_token=rt, presented_token="a.b.c")
+    assert r.status == 400 and r.json()["error"] == "invalid_request"
 
 
 @pytest.mark.req("SUP-025")
@@ -165,15 +335,40 @@ def test_retry_while_pending_gets_same_location():
 
 @pytest.mark.req("SUP-027", "SUP-029")
 def test_poll_answer_is_signed_for_the_poll():
-    ss, ps, clock = make_env(clarify_missing_justification=True)
-    s256 = connected((ss, ps, clock))
-    _, r, _ = ps.auth_token_request(ss, SUB, AGENT, s256, MAIL, scope="mail.send")
+    # A connect confirmed by the operator is answered on the poll: signed for that GET.
+    ss, ps, clock = make_env(auto_connect=False)
+    r = ps.connect(ss, SUB)
     loc = r.headers["Location"]
-    ps.call(ss, "POST", loc, {"action": "clarification_response",
-                              "clarification_response": "status report"})
+    code = r.headers["AAuth-Requirement"].split('code="')[1].rstrip('"')
+    ok = ss.handle(HttpRequest("POST", "ss.example", "/interaction",
+                               {"content-type": "application/x-www-form-urlencoded"},
+                               f"code={code}&admin_token=operator-secret".encode()))
+    assert ok.status == 200
     g = ps.call(ss, "GET", loc)  # verified by the PS against this GET
     assert g.status == 200 and '"@path";req' in g.headers["Signature-Input"]
     assert '"content-digest";req' not in g.headers["Signature-Input"]
+
+
+def test_a_pending_url_is_gone_once_it_returned_a_terminal_response():
+    """Protocol L2840: "Once a terminal response is returned, the pending URL MUST return
+    `410 Gone`". The clarification reply is answered with the decision; after it the URL
+    is gone for every method. The record itself stays: the decision is still on file."""
+    ss, ps, clock = make_env(clarify_missing_justification=True)
+    s256 = connected((ss, ps, clock))
+    sdi, r, _ = ps.auth_token_request(ss, SUB, AGENT, s256, MAIL, scope="mail.send")
+    loc = r.headers["Location"]
+    a = ps.call(ss, "POST", loc, {"action": "clarification_response",
+                                  "clarification_response": "status report"})
+    assert a.status == 200
+    for m, b in (("GET", None), ("POST", {"action": "clarification_response",
+                                          "clarification_response": "again"}),
+                 ("DELETE", None)):
+        assert ps.call(ss, m, loc, b).status == 410, m
+    assert ss.store.decisions[f"{ps.issuer}|{sdi}"].decision == a.json()["decision"]
+    # A 0.1.x snapshot keeps no `gone`: an answered clarification is gone all the same.
+    p = ss.store.pending[loc.rsplit("/", 1)[1]]
+    p.gone = p.cancelled = False
+    assert ps.call(ss, "GET", loc).status == 410
 
 
 @pytest.mark.req("SUP-P05")
@@ -189,10 +384,10 @@ def test_clarify_updated_request():
                                     "presented_token": "a.b.c"})
     assert ans.status == 200 and ans.json()["decision"] == "allow"
     bad = ps.call(ss, "POST", loc, {"action": "nonsense"})
-    assert bad.status == 200  # already resolved: the terminal answer is replayed
+    assert bad.status == 410  # Protocol L2840: the terminal answer was returned, URL is gone
 
 
-@pytest.mark.req("SUP-P16")
+@pytest.mark.req("SUP-P16", "REF-009", "REF-050")
 def test_updated_request_for_another_resource_is_refused():
     ss, ps, clock = make_env(clarify_missing_justification=True)
     s256 = connected((ss, ps, clock), resources=(HR, MAIL, CAL))
@@ -258,7 +453,7 @@ def test_optional_chain_tokens_accepted(env):
     assert r.json()["decision"] == "allow"
 
 
-@pytest.mark.req("SUP-051", "SUP-053", "SUP-054", "SUP-055", "SUP-056", "SUP-057")
+@pytest.mark.req("SUP-051", "SUP-053", "SUP-054", "SUP-055", "SUP-056")
 def test_decision_resolved_members(env):
     ss, ps, _ = env
     s256 = connected(env)

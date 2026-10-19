@@ -17,7 +17,7 @@ from aauth_supervision_server.httpsig import signature_base
 from aauth_supervision_server.jwk import SigningKey
 from aauth_supervision_server.policy import Act, Policy
 from aauth_supervision_server.resolver import _find
-from aauth_supervision_server.sfv import InnerList, Item, ser_bare
+from aauth_supervision_server.sfv import InnerList, Item, parse_dictionary, ser_bare, ser_dictionary
 from aauth_supervision_server.store import HistoryEntry, Store
 
 HR, MAIL = "https://hr.example", "https://mail.example"
@@ -57,12 +57,19 @@ def test_answer_must_be_allow_deny_or_abandoned():
     assert ss.store.decisions[f"{ps.issuer}|{sdi}"].decision == "ask"
 
 
-def test_alg_parameter_must_match_the_key():
+@pytest.mark.req("VER-014")
+def test_an_alg_parameter_does_not_refuse_a_good_signature():
+    """Protocol L2236: verifiers "MUST ignore" `alg`. The PS signs with an `alg` that does
+    not even name its key's algorithm; the SS verifies with the key and connects."""
     ss, ps, _ = make_env()
     req = ps.build("POST", "/connect", CONNECT)
-    req.headers["signature-input"] += ';alg="rsa-pss-sha512"'
+    comps = parse_dictionary(req.headers["signature-input"])["sig"]
+    assert isinstance(comps, InnerList)
+    comps.params["alg"] = "rsa-pss-sha512"
+    req.headers["signature-input"] = ser_dictionary({"sig": comps})
+    req.headers["signature"] = ser_dictionary({"sig": Item(ps.key.sign(signature_base(comps, req)))})
     r = ss.handle(req)
-    assert r.status == 401 and "does not match the key" in r.json()["detail"]
+    assert r.status == 200, r.body
 
 
 def test_non_ascii_covered_value_is_a_client_error():
@@ -76,20 +83,35 @@ def test_non_ascii_covered_value_is_a_client_error():
         signature_base(comps, req)
 
 
+@pytest.mark.req("VER-028")
 def test_unknown_kid_refetch_is_rate_limited():
+    """Protocol L2284: "Implementations MUST NOT fetch a given issuer's JWKS more frequently
+    than once per minute." Five requests with a made-up kid cost one refetch; 59 seconds
+    later still none; a full minute after the refetch, one more."""
     ss, ps, clock = make_env()
     ps.call(ss, "POST", "/connect", CONNECT)
     fetcher = ss.resolver.fetcher
-    req = ps.build("POST", "/connect", CONNECT | {"id": "c-2"})
-    req.headers["signature-key"] = req.headers["signature-key"].replace(
-        'kid="', 'kid="nope-')
+
+    def made_up_kid(n: int):
+        req = ps.build("POST", "/connect", CONNECT | {"id": f"c-{n}"})
+        req.headers["signature-key"] = req.headers["signature-key"].replace(
+            'kid="', 'kid="nope-')
+        return req
+
     before = len(fetcher.calls)
-    for _ in range(5):
-        assert ss.handle(req).status == 401
-    assert len(fetcher.calls) - before <= 2  # one refetch (metadata + JWKS), not five
-    clock.t += 31
-    ss.handle(req)
-    assert len(fetcher.calls) - before <= 4  # the next refetch only after the interval
+    assert ss.handle(made_up_kid(1)).status == 401
+    assert len(fetcher.calls) == before  # fetched at connect, less than a minute ago
+    clock.t += 60
+    for n in range(2, 7):
+        assert ss.handle(made_up_kid(n)).status == 401
+    first = len(fetcher.calls) - before
+    assert first >= 1  # one refetch, made by the first of the five
+    clock.t += 59
+    assert ss.handle(made_up_kid(7)).status == 401
+    assert len(fetcher.calls) - before == first  # not within the minute
+    clock.t += 1
+    assert ss.handle(made_up_kid(8)).status == 401
+    assert len(fetcher.calls) - before == 2 * first  # the next once a minute has passed
 
 
 def test_jwks_kid_must_be_unique_and_a_signing_key():
@@ -162,7 +184,6 @@ def test_repeated_field_lines_combine_and_host_is_single():
         httpd.server_close()
 
 
-
 def test_store_keys_do_not_collide():
     assert Store.k("iss", "a|b", "c") != Store.k("iss", "a", "b|c")
     assert Store.k("iss", "a%7Cb") != Store.k("iss", "a|b")
@@ -199,3 +220,27 @@ def test_agent_data_cannot_lower_any_rule_shape():
 @pytest.mark.parametrize("v, s", [(2.0, "2.0"), (1.5, "1.5"), (0.125, "0.125"), (-3.0, "-3.0")])
 def test_decimal_keeps_a_fractional_digit(v, s):
     assert ser_bare(v) == s
+
+
+@pytest.mark.parametrize(("ip", "public"), [
+    # 6to4 (RFC 3056) and local-use NAT64 (RFC 8215) carry an IPv4 address: judged by it,
+    # on every Python version (3.11 alone took the first two as global).
+    ("2002:7f00:1::1", False), ("2002:a9fe:a9fe::1", False),
+    ("64:ff9b:1::a9fe:a9fe", False), ("2002:808:808::1", True),
+    # Deprecated site-local (RFC 3879): never a public destination.
+    ("fec0::1", False),
+])
+def test_egress_judges_an_ipv6_address_by_the_ipv4_address_it_carries(ip, public):
+    assert _is_public(ip) is public
+
+
+@pytest.mark.parametrize(("ops", "usable"), [
+    (["verify"], True), (["sign", "verify"], True), (["encrypt"], False), ([], False)])
+def test_a_key_whose_key_ops_leave_out_verify_never_verifies(ops, usable):
+    # RFC 7517 Section 4.3: `key_ops` names the operations the key is for.
+    jwk = SigningKey.generate("k").public_jwk() | {"key_ops": ops}
+    if usable:
+        assert _find({"keys": [jwk]}, "k") is not None
+    else:
+        with pytest.raises(SignatureError):
+            _find({"keys": [jwk]}, "k")

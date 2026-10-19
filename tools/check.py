@@ -1,10 +1,10 @@
 """Offline CI-equivalent gate: everything a merge check would run, no network.
 
-    python tools/check.py            # run every gate, stop reporting at the end
+    python tools/check.py            # run every gate, report at the end
     python tools/check.py --fast     # skip the branch-coverage run (reuse plain pytest)
 
 Gates, in order:
-  1. ruff          lint (src + tests + tools + examples)
+  1. ruff          lint (src + tests + tools + examples + mutmut_config.py)
   2. mypy          type check (src and examples, the typed surface)
   3. pytest        deterministic suite under branch coverage, fail_under from pyproject
   4. properties    the Hypothesis property and model-based lifecycle tests (kept out of
@@ -12,8 +12,8 @@ Gates, in order:
   5. matrix        conformance matrix is not stale  (tools/extract_matrix.py --check)
   6. adversarial   adversarial results are not stale (tools/run_adversarial.py --check)
 
-Exit code is non-zero if any gate fails. This is what to run before saying the
-tree is green; it needs no outbound network and no second implementation.
+Exit code is non-zero if any gate fails. Run it before opening a pull request; it
+needs no outbound network and no second implementation.
 """
 
 from __future__ import annotations
@@ -52,13 +52,17 @@ def main() -> int:
         # what Hypothesis happened to draw; the property tests then run as their own gate.
         cov_ok = run("pytest+coverage", [PY, "-m", "coverage", "run", "-m", "pytest", "-q",
                                          "--ignore=tests/test_properties.py",
-                                         "--ignore=tests/test_properties_lifecycle.py"])
+                                         "--ignore=tests/test_properties_lifecycle.py",
+                                         "--ignore=tests/test_properties_open_acts.py",
+                                         "--ignore=tests/test_properties_cross_mission.py",
+                                         "--ignore=tests/test_properties_markdown.py"])
         if cov_ok:
             cov_ok = run("coverage report", [PY, "-m", "coverage", "report"])
         results.append(("pytest+coverage", cov_ok))
         results.append(("properties", run("properties", [
             PY, "-m", "pytest", "-q", "tests/test_properties.py",
-            "tests/test_properties_lifecycle.py"])))
+            "tests/test_properties_lifecycle.py", "tests/test_properties_open_acts.py",
+            "tests/test_properties_cross_mission.py", "tests/test_properties_markdown.py"])))
 
     results.append(("matrix", run("matrix", [PY, "tools/extract_matrix.py", "--check"])))
     results.append(("adversarial", run("adversarial", [PY, "tools/run_adversarial.py", "--check"])))

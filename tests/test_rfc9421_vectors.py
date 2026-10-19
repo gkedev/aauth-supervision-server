@@ -13,7 +13,7 @@ paths to the standard's own keys and signatures, independently of any code here.
 
 Each vector exercises `signature_base` (byte-for-byte) plus `jwk.VerifyKey.verify`
 and `jwk.key_from_jwk`, so a regression in canonicalisation, EC point handling, or
-Ed25519 handling fails here against the standard rather than against our own fixtures.
+Ed25519 handling fails here against the standard rather than against this repository's own fixtures.
 """
 
 from __future__ import annotations
@@ -68,7 +68,7 @@ def _ed25519_public_jwk(raw: bytes, kid: str) -> dict:
 # =============================================================== B.2.6 ed25519
 
 def test_b26_ed25519_signature_base_and_sign_verify() -> None:
-    """B.2.6: reproduce the published signature and verify it through our code."""
+    """B.2.6: reproduce the published signature and verify it through this SS's code."""
     priv = load_pem_private_key(B14_ED25519_PRIVATE_PEM, None)
     assert isinstance(priv, ed25519.Ed25519PrivateKey)
 

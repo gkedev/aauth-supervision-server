@@ -27,8 +27,8 @@ def _snapshot(tmp_path):
     ss, ps, _ = env
     ss.store.path = snap
     s256 = connected(env)
-    # A payment that the policy allows (decision + issuance event), plus a second act,
-    # so missions, decisions and events_seen are all populated.
+    # Two decision requests in the mission (a mail send and an HR read), so connections,
+    # missions, decisions and events_seen are all populated.
     ps.auth_token_request(ss, SUB, AGENT, s256, "https://mail.example",
                           scope="send", justification="external send")
     ps.auth_token_request(ss, SUB, AGENT, s256, "https://hr.example",
@@ -106,12 +106,14 @@ def test_unreadable_snapshot_is_moved_aside(tmp_path):
     moved = list(tmp_path.glob("state.json.unreadable-*"))
     assert len(moved) == 1
     # a fresh empty snapshot can be written over the now-clear path
-    s.save() if s.path else None
+    s.save()
+    assert snap.exists()
 
 
-def test_extra_top_level_key_is_ignored_or_rejected(tmp_path):
+def test_an_extra_top_level_key_is_ignored(tmp_path):
     snap, data = _snapshot(tmp_path)
     data["surprise"] = {"anything": [1, 2, 3]}
+    data["revoked"] = "a member 0.1.x kept"
     snap.write_text(json.dumps(data), encoding="utf-8")
     s = Store(str(snap))
     # unknown top-level keys are simply not read; the known tables still load
@@ -119,7 +121,7 @@ def test_extra_top_level_key_is_ignored_or_rejected(tmp_path):
 
 
 @pytest.mark.parametrize("key", ["connections", "agents", "missions", "decisions",
-                                 "pending", "reach", "events_seen", "agent_history", "revoked"])
+                                 "pending", "reach", "events_seen", "agent_history"])
 def test_each_table_wrong_container_type(tmp_path, key):
     snap, data = _snapshot(tmp_path)
     data[key] = "not a container"

@@ -34,7 +34,10 @@ def pytest(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     # that kills it on every run, never by an input one run happened to draw.
     return subprocess.run([sys.executable, "-B", "-m", "pytest", "-q", "-x",
                            "-p", "no:cacheprovider", "--ignore=tests/test_properties.py",
-                           "--ignore=tests/test_properties_lifecycle.py", "tests"],
+                           "--ignore=tests/test_properties_lifecycle.py",
+                           "--ignore=tests/test_properties_open_acts.py",
+                           "--ignore=tests/test_properties_cross_mission.py",
+                           "--ignore=tests/test_properties_markdown.py", "tests"],
                           cwd=ROOT, capture_output=True, text=True, env=env)
 
 

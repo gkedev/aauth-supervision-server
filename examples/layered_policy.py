@@ -33,13 +33,25 @@ Two advisors are included:
   supply, so no vendor SDK is imported here. It parses a strict JSON answer and treats
   any other output as unavailable.
 
-Use it in place of the APC policy when building the server:
+Use it in place of the APC policy when building the server, from the repository root
+(this module is an example, not part of the package):
 
-    floor = Policy(PolicyConfig.from_dict(json.loads(Path("policy.json").read_text())))
-    policy = LayeredPolicy(floor, PreferenceAdvisor([
+    import json, sys
+    from pathlib import Path
+    from aauth_supervision_server.cli import build_server
+    from aauth_supervision_server.http_server import serve
+    from aauth_supervision_server.service import SupervisionServer
+    sys.path.insert(0, "examples")
+    from layered_policy import LayeredPolicy, Preference, PreferenceAdvisor
+
+    def load(p): return json.loads(Path(p).read_text(encoding="utf-8"))
+    apc = build_server(load("examples/server.json"), load("examples/policy.json"),
+                       "keys/ss-key.json", "state/ss.json")
+    policy = LayeredPolicy(apc.policy, PreferenceAdvisor([
         Preference("read|ReadFile", "allow", "Reading files is fine for any mission."),
     ]))
-    server = SupervisionServer(config, policy, resolver, key)
+    server = SupervisionServer(apc.cfg, policy, apc.resolver, apc.key, apc.store)
+    serve(server, port=8443).serve_forever()
 """
 
 from __future__ import annotations
@@ -47,10 +59,12 @@ from __future__ import annotations
 import fnmatch
 import json
 import re
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
+from aauth_supervision_server import markdown as md
 from aauth_supervision_server.policy import Act, Classification, Decision, Policy
 from aauth_supervision_server.store import HistoryEntry, Mission, Reach
 
@@ -104,6 +118,9 @@ class LayeredPolicy:
     def ask_on_mission_update(self) -> bool:
         return self.floor.ask_on_mission_update
 
+    def serves_on_identity(self, resource: str) -> bool:
+        return self.floor.serves_on_identity(resource)
+
     def classify(self, act: Act) -> Classification:
         return self.floor.classify(act)
 
@@ -132,11 +149,15 @@ class LayeredPolicy:
         if advice.verdict == "allow" and self.may_settle(self.floor, d):
             return replace(d, decision="allow", summary="", recommendation="", apply_options=[],
                            narrow=self.floor.narrow(mission), trace=trace)
-        # The person still decides. The advisor's view goes with the question; the floor's
-        # own recommendation, if any, is kept.
+        # The person still decides, and the floor's own recommendation, if any, is kept.
+        # An `ask` from the advisor goes with the question as its view, shown as its
+        # words (a model reads the agent's text, so its rationale is no Markdown the
+        # person's screen should render). An `allow` the floor does not let it apply is
+        # left in the trace: shown, it would be the allow recommendation the floor does
+        # not make.
         summary = d.summary
-        if rationale:
-            summary = f"{summary}\n\nAdvisor ({advice.verdict}): {rationale}".strip()
+        if rationale and advice.verdict == "ask":
+            summary = f"{summary}\n\nAdvisor ({advice.verdict}): {md.code(rationale)}".strip()
         return replace(d, summary=summary, trace=trace)
 
 
@@ -188,11 +209,15 @@ Agent's justification: <untrusted>{justification}</untrusted>
 class ModelAdvisor:
     """Advice from a language model behind `complete(prompt) -> str`.
 
-    `complete` is yours: any client, any model, with your own timeout. Its output must be
-    the JSON object the prompt asks for; anything else raises `AdvisorError`, which the
-    layered policy treats as "advisor unavailable"."""
+    `complete` is yours: any client, any model. Its output must be the JSON object the
+    prompt asks for; anything else raises `AdvisorError`, which the layered policy treats
+    as "advisor unavailable". So does a call that fails, or that takes longer than
+    `timeout` seconds: the SS decides while the PS waits, under its store lock, and has no
+    deferred decision to answer later with, so the person decides instead. Give your
+    client a timeout of its own as well; a call past this one is left to finish."""
 
     complete: Callable[[str], str]
+    timeout: float = 5.0
 
     def prompt(self, act: Act, floor: Decision, mission: Mission | None) -> str:
         target = act.resource or act.tool
@@ -205,7 +230,23 @@ class ModelAdvisor:
 
     def advise(self, act: Act, floor: Decision, mission: Mission | None,
                history: list[HistoryEntry]) -> Advice:
-        raw = self.complete(self.prompt(act, floor, mission))
+        box: dict[str, Any] = {}
+        prompt = self.prompt(act, floor, mission)
+
+        def call() -> None:
+            try:
+                box["raw"] = self.complete(prompt)
+            except Exception as e:  # reported below, as the advisor being unavailable
+                box["error"] = e
+
+        worker = threading.Thread(target=call, daemon=True)
+        worker.start()
+        worker.join(self.timeout)
+        if "error" in box:
+            raise AdvisorError("the model call failed") from box["error"]
+        if "raw" not in box:
+            raise AdvisorError(f"the model did not answer within {self.timeout} s")
+        raw = box["raw"]
         try:
             answer = json.loads(raw)
         except (TypeError, ValueError) as e:

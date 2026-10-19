@@ -51,7 +51,8 @@ def test_ss_makes_no_request_of_the_ps_on_any_path():
 
 
 @pytest.mark.parametrize("member, value", [
-    ("sub", 0), ("sub", []), ("sdi", {"a": 1}), ("agent", True), ("iat", "1"), ("iat", 1.5),
+    ("sub", 0), ("sub", []), ("sdi", {"a": 1}), ("agent", True), ("iat", "1"),
+    ("iat", float("nan")), ("iat", 2 ** 53),
     ("description", ["x"]), ("parameters", "x"), ("tools", {}), ("resources", "x"),
     ("aud", [1]), ("exp", "soon")])
 def test_a_member_of_the_wrong_type_is_invalid_request(member, value):

@@ -26,9 +26,9 @@ def main() -> int:
                  or out_js.read_text(encoding="utf-8") != js)
         print("stale: run python tools/run_adversarial.py" if stale else "results up to date")
         return 1 if stale else 0
-    out_md.write_text(md, encoding="utf-8")
-    out_js.write_text(js, encoding="utf-8")
-    print(md)
+    out_md.write_text(md, encoding="utf-8", newline="\n")  # LF on every platform
+    out_js.write_text(js, encoding="utf-8", newline="\n")
+    print(f"wrote {out_md} and {out_js}")
     return 0
 
 

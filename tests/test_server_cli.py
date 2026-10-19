@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import http.client
 import io
 import json
@@ -135,6 +136,7 @@ def test_cli_keygen_and_build_server(tmp_path):
     ss = cli.build_server(cfg, pol, str(key), str(tmp_path / "state.json"))
     assert ss.key is not None and ss.key.kid == "ss-1"
     assert ss.metadata()["jwks_uri"] == "https://ss.example/.well-known/jwks.json"
+    assert ss.resolver.keep == frozenset({"https://ps.example"})  # never evicted
 
 
 def test_cli_explain(capsys):
@@ -148,6 +150,27 @@ def test_cli_explain(capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["decision"] == "ask" and "uncertain=True" in out["trace"][0]
 
+
+def test_every_command_describes_each_of_its_options_in_help(monkeypatch):
+    """`aauth-ss <command> --help` says what each option and positional argument is for,
+    not only its name: every action of every command carries a help text that is shown."""
+    parsers = []
+
+    def capture(self, args=None, namespace=None):
+        parsers.append(self)
+        raise SystemExit(0)
+
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", capture)
+    with pytest.raises(SystemExit):
+        cli.main(["demo"])
+    (top,) = parsers
+    (sub,) = (a for a in top._actions if isinstance(a, argparse._SubParsersAction))
+    assert {"keygen", "check-policy", "explain", "serve", "demo"} <= set(sub.choices)
+    undescribed = [f"{name} {'/'.join(a.option_strings) or a.dest}"
+                   for name, parser in sub.choices.items() for a in parser._actions
+                   if not isinstance(a, argparse._HelpAction)
+                   and (not a.help or a.help == argparse.SUPPRESS)]
+    assert undescribed == []
 
 
 def test_access_log_goes_through_logging_without_bodies(live, caplog):
@@ -163,3 +186,74 @@ def test_access_log_goes_through_logging_without_bodies(live, caplog):
     lines = [r.getMessage() for r in caplog.records if r.name == "aauth_supervision_server.access"]
     assert any('"POST /decision HTTP/1.1"' in m for m in lines), lines
     assert not any("do-not-log" in m for m in lines)
+
+
+def test_the_access_log_keeps_the_path_but_not_the_query(live, caplog):
+    """The connect confirmation page takes the interaction code in its query
+    (`{url}?code={code}`, Supervision L244). The access log line names the method, path and
+    status, never the query, so the code does not end up in the operator's logs."""
+    import logging
+    _, _, port = live
+    with caplog.at_level(logging.INFO, logger="aauth_supervision_server.access"):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/interaction?code=SECRETCODE1", headers={"host": "ss.example"})
+        assert conn.getresponse().status == 410
+        conn.close()
+    lines = [r.getMessage() for r in caplog.records if r.name == "aauth_supervision_server.access"]
+    assert any("GET /interaction" in m and "410" in m for m in lines), lines
+    assert not any("SECRETCODE1" in m or "?" in m for m in lines), lines
+
+
+def _raw(port: int, data: bytes) -> bytes:
+    import socket
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+        s.sendall(data)
+        out = b""
+        try:
+            while chunk := s.recv(4096):
+                out += chunk
+        except OSError:
+            pass
+    return out
+
+
+def test_the_access_log_escapes_control_characters(live, caplog):
+    """A request line may carry ESC and other control bytes (only CR LF end it). Written to
+    a terminal they would clear it, retitle it or forge a line, so the access log escapes
+    them, as the standard library's own `log_message` does. A backslash the client sent is
+    doubled, so its text cannot pass for an escaped control character."""
+    import logging
+    _, _, port = live
+    with caplog.at_level(logging.INFO, logger="aauth_supervision_server.access"):
+        _raw(port, b"GET /\x1b[2J\x1b]0;x\x07\x9b/y\\x1b HTTP/1.1\r\nHost: ss.example\r\n"
+                   b"Connection: close\r\n\r\n")
+    lines = [r.getMessage() for r in caplog.records if r.name == "aauth_supervision_server.access"]
+    assert any("GET /\\x1b[2J\\x1b]0;x\\x07\\x9b/y\\\\x1b HTTP/1.1" in m and "404" in m
+               for m in lines), lines
+    assert not any(ch in m for m in lines for ch in "\x1b\x07\x9b"), lines
+
+
+@pytest.mark.parametrize("line", [b"GARBAGE", b"GET / HTTP/1.1 extra", b"\x1b[2J"])
+def test_a_malformed_request_line_gets_a_400_and_no_traceback(line, capsys):
+    """The standard library answers a request line it cannot parse with 400, logging it
+    before the path is known; the access log line must not need the path."""
+    import sys as _sys
+    ss, ps, _ = make_env()
+    httpd = serve(ss, "127.0.0.1", 0)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        with capsys.disabled():
+            buf, old = io.StringIO(), _sys.stderr
+            _sys.stderr = buf
+            try:
+                reply = _raw(httpd.server_address[1], line + b"\r\n\r\n")
+            finally:
+                _sys.stderr = old
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    # A line that does not parse reads as HTTP/0.9, which has no status line; the reply has
+    # one all the same, and the error format of every other refusal.
+    assert reply.startswith(b"HTTP/1.1 400 ") and b'{"error":"invalid_request"' in reply, reply
+    assert "Traceback" not in buf.getvalue(), buf.getvalue()

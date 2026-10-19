@@ -15,6 +15,7 @@ import pytest
 from aauth_supervision_server.egress import EgressPolicy, FetchError, HttpsFetcher
 
 HOST = "127.0.0.1"
+HEADERS_CUT = threading.Event()
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -49,6 +50,18 @@ class _Handler(BaseHTTPRequestHandler):
                 except OSError:
                     return
                 time.sleep(0.05)
+        elif p == "/trickle-headers":
+            # Each header byte arrives well within a socket read timeout; the headers as a
+            # whole never finish.
+            try:
+                self.wfile.write(b"HTTP/1.1 200 OK\r\n")
+                for _ in range(400):
+                    self.wfile.write(b"X")
+                    self.wfile.flush()
+                    time.sleep(0.05)
+            except OSError:
+                HEADERS_CUT.set()  # the client closed the connection
+                return
         else:
             self._send(500, b"{}")
 
@@ -78,11 +91,13 @@ def _admitted(**kw: object) -> HttpsFetcher:
                                      allow_http_hosts=frozenset({HOST}), **kw))  # type: ignore[arg-type]
 
 
+@pytest.mark.req("VER-030")
 def test_defaults_refuse_plain_http(port: int) -> None:
     with pytest.raises(FetchError, match="non-HTTPS"):
         HttpsFetcher().fetch_json(f"http://{HOST}:{port}/ok")
 
 
+@pytest.mark.req("VER-030")
 def test_defaults_refuse_loopback_even_when_http_admitted(port: int) -> None:
     f = HttpsFetcher(EgressPolicy(allow_http_hosts=frozenset({HOST})))
     with pytest.raises(FetchError, match="not public"):
@@ -97,6 +112,7 @@ def test_query_string_is_sent(port: int) -> None:
     assert _admitted().fetch_json(f"http://{HOST}:{port}/ok?x=1") == {"q": True}
 
 
+@pytest.mark.req("VER-030")
 def test_redirect_is_refused(port: int) -> None:
     with pytest.raises(FetchError, match="redirect refused"):
         _admitted().fetch_json(f"http://{HOST}:{port}/redirect")
@@ -134,3 +150,70 @@ def test_pinned_tls_to_a_non_tls_server_fails_cleanly(port: int) -> None:
     f = HttpsFetcher(EgressPolicy(allow_private_hosts=frozenset({HOST}), timeout=2))
     with pytest.raises(FetchError, match="fetch failed"):
         f.fetch_json(f"https://{HOST}:{port}/ok")
+
+
+def test_trickled_headers_hit_the_same_deadline(port: int) -> None:
+    # The deadline covers the headers as well as the body: a server trickling its
+    # headers cannot hold a thread past it.
+    start = time.monotonic()
+    with pytest.raises(FetchError, match="exceeded 0.5s"):
+        _admitted(timeout=0.5).fetch_json(f"http://{HOST}:{port}/trickle-headers")
+    assert time.monotonic() - start < 2
+    # And the connection is closed at the deadline, so the worker does not keep reading.
+    assert HEADERS_CUT.wait(3)
+
+
+def test_name_resolution_is_under_the_deadline(port: int,
+                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    # getaddrinfo has no timeout of its own. A resolver that answers after the deadline
+    # gets no connection made at all.
+    import socket
+    real = socket.getaddrinfo
+    connected = threading.Event()
+
+    def slow(*a: object, **k: object) -> object:
+        time.sleep(0.8)
+        return real(*a, **k)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(socket, "getaddrinfo", slow)
+    monkeypatch.setattr("http.client.HTTPConnection.connect",
+                        lambda self: connected.set())
+    start = time.monotonic()
+    with pytest.raises(FetchError, match="exceeded 0.3s"):
+        _admitted(timeout=0.3).fetch_json(f"http://{HOST}:{port}/ok")
+    assert time.monotonic() - start < 0.7
+    time.sleep(0.8)  # the resolver answers; the worker stops before connecting
+    assert not connected.is_set()
+
+
+def test_an_unexpected_error_in_the_worker_is_raised_as_is(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*a: object, **k: object) -> object:
+        raise RuntimeError("resolver bug")
+
+    monkeypatch.setattr("socket.getaddrinfo", boom)
+    with pytest.raises(RuntimeError, match="resolver bug"):
+        HttpsFetcher().fetch_json("https://example.org/x")
+
+
+def test_a_worker_that_connects_after_the_deadline_sends_nothing(
+        port: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A connect that completes after the deadline sends nothing: there is no socket to
+    # shut down at the deadline, so the worker itself stops once the deadline has passed.
+    import http.client
+    real = http.client.HTTPConnection.connect
+    sent = threading.Event()
+
+    def slow_connect(self: http.client.HTTPConnection) -> None:
+        time.sleep(0.6)
+        real(self)
+
+    def watch_send(self: http.client.HTTPConnection, *a: object, **k: object) -> None:
+        sent.set()
+
+    monkeypatch.setattr(http.client.HTTPConnection, "connect", slow_connect)
+    monkeypatch.setattr(http.client.HTTPConnection, "request", watch_send)
+    with pytest.raises(FetchError, match="exceeded 0.3s"):
+        _admitted(timeout=0.3).fetch_json(f"http://{HOST}:{port}/ok")
+    time.sleep(0.8)  # the connect completes; the worker must stop there
+    assert not sent.is_set()

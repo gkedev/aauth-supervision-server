@@ -29,7 +29,7 @@ BROKEN = [
 def _signed(env):
     ss, ps, _ = env
     assert ps.connect(ss, SUB).status == 200
-    # A fresh connect request we can mutate per iteration.
+    # A fresh connect request to mutate per iteration.
     return ps.build("POST", "/connect",
                     {"action": "connect", "id": "c-fuzz", "iat": 1, "sub": SUB})
 

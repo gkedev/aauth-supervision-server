@@ -1,8 +1,8 @@
-module github.com/xmuruaga/aauth-supervision-server/interop/auth-go
+module github.com/xmuruaga/aauth-supervision-server/interop/aauth-go
 
 go 1.26.0
 
-require github.com/aauth-dev/auth-go v0.1.2-0.20261008085131-188231b50f10
+require github.com/aauth-dev/aauth-go v0.2.0
 
 require (
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1 // indirect
@@ -23,6 +23,6 @@ require (
 	github.com/segmentio/asm v1.2.1 // indirect
 	github.com/valyala/fastjson v1.6.10 // indirect
 	github.com/yaronf/httpsign v0.5.2 // indirect
-	golang.org/x/crypto v0.55.0 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 )

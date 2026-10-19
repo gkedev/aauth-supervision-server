@@ -16,7 +16,6 @@ from aauth_supervision_server.httpsig import (
     MAX_LABELS,
     HttpRequest,
     HttpResponse,
-    _check_alg_param,
     build_components,
     check_content_digest,
     content_digest,
@@ -132,13 +131,17 @@ def test_header_values_are_trimmed_and_only_obs_fold_is_collapsed() -> None:
 # --------------------------------------------------------------- algorithm
 
 
-def test_alg_parameter_must_match_the_key_when_present() -> None:
-    vk = key_from_jwk(KEY.public_jwk())
-    _check_alg_param(InnerList([], {}), vk)
-    _check_alg_param(InnerList([], {"alg": "ed25519"}), vk)
-    for bad in ("ecdsa-p256-sha256", 7):
-        with pytest.raises(SignatureError, match="does not match the key"):
-            _check_alg_param(InnerList([], {"alg": bad}), vk)
+@pytest.mark.req("VER-014")
+def test_an_alg_parameter_is_ignored_and_the_key_decides() -> None:
+    """Protocol L2236: "verifiers MUST ignore it if present, per RFC 9421, Section 3.3.7;
+    the algorithm is determined from the key". A correctly signed request carrying any
+    `alg`, matching the key or not, verifies; `alg` is still covered, so adding one after
+    signing breaks the signature."""
+    for alg in ("ed25519", "ecdsa-p256-sha256", "rsa-pss-sha512", 7):
+        assert verify(signed(extra={"alg": alg})).id == PS
+    req = signed()
+    req.headers["signature-input"] += ';alg="ed25519"'
+    assert refused(req, "invalid_signature").detail == "signature does not verify"
 
 
 # ------------------------------------------------------- request verification
@@ -150,6 +153,7 @@ def test_valid_request_verifies() -> None:
                                                        NOW)
 
 
+@pytest.mark.req("VER-016")
 def test_all_three_headers_are_required() -> None:
     for drop in ("signature-input", "signature", "signature-key"):
         req = signed()
@@ -192,6 +196,7 @@ def test_label_count_limit_is_inclusive() -> None:
     assert e.detail == "more than 4 signatures"
 
 
+@pytest.mark.req("VER-017")
 def test_default_window_is_60_seconds_both_ways_and_inclusive() -> None:
     assert verify(signed(NOW - 60)).created == NOW - 60
     assert "older" in refused(signed(NOW - 61), "invalid_signature").detail
@@ -199,15 +204,34 @@ def test_default_window_is_60_seconds_both_ways_and_inclusive() -> None:
     refused(signed(NOW + 61), "clock_skew")
 
 
+@pytest.mark.req("VER-012", "VER-013")
 def test_created_must_be_an_integer() -> None:
     for bad in ("x", True):
         assert "created" in refused(signed(bad), "invalid_signature").detail
 
 
+@pytest.mark.req("VER-023")
 def test_expires_is_honoured_and_inclusive() -> None:
     assert verify(signed(extra={"expires": NOW})).created == NOW
     assert "expired" in refused(signed(extra={"expires": NOW - 1}), "invalid_signature").detail
-    assert verify(signed(extra={"expires": True})).created == NOW  # not an integer: ignored
+    # RFC 9421 Section 2.3: `expires` is "of type Integer"; any other type is malformed.
+    for bad in (True, "1790600000"):
+        e = refused(signed(extra={"expires": bad}), "invalid_signature")
+        assert e.detail == "expires is not an Integer"
+
+
+def test_component_parameters_this_verifier_does_not_implement_are_refused() -> None:
+    """RFC 9421 Section 2.5: a covered component whose identifier "includes a parameter
+    that is unknown or does not apply" MUST produce an error, never be read without it.
+    `req` does not apply to a request's own components."""
+    req = signed()
+    for params in ({"sf": True}, {"key": "a"}, {"bs": True}, {"name": "x"}, {"tr": True},
+                   {"req": True}):
+        il = InnerList([Item("content-type", params)], {"created": NOW})
+        with pytest.raises(SignatureError) as e:
+            signature_base(il, req)
+        assert e.value.error == "invalid_input" and "unsupported component parameter" in \
+            e.value.detail
 
 
 def test_signature_key_needs_non_empty_id_dwk_and_kid() -> None:
@@ -218,6 +242,7 @@ def test_signature_key_needs_non_empty_id_dwk_and_kid() -> None:
         assert e.detail == "jwks_uri requires id, dwk and kid"
 
 
+@pytest.mark.req("VER-008")
 def test_dwk_is_checked_unless_disabled() -> None:
     req = signed(sk_params=f'id="{PS}";dwk="other.json";kid="k1"')
     assert "expected" in refused(req, "invalid_key").detail

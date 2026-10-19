@@ -1,6 +1,7 @@
 cff-version: 1.2.0
 message: >-
-  If you use this software, please cite the paper it implements, as below.
+  If you use this software, please cite the paper whose policy model it implements,
+  as below.
 title: aauth-supervision-server
 abstract: >-
   An independent Supervision Server for AAuth Supervision -00, with a deterministic,
@@ -9,8 +10,8 @@ type: software
 authors:
   - family-names: Muruaga
     given-names: Xabier
-version: 0.1.0
-date-released: 2026-10-08
+version: 0.2.0
+date-released: 2026-10-19
 license: Apache-2.0
 repository-code: https://github.com/xmuruaga/aauth-supervision-server
 keywords:

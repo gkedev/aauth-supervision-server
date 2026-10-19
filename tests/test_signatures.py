@@ -105,7 +105,7 @@ def test_response_req_components():
 # ------------------------------------------------------------- verification
 
 
-@pytest.mark.req("SUP-011")
+@pytest.mark.req("SUP-011", "VER-001")
 @pytest.mark.parametrize("alg", ["Ed25519", "ES256"])
 def test_verify_ok(alg):
     key, res = _ps(alg)
@@ -113,6 +113,7 @@ def test_verify_ok(alg):
     assert v.id == PS and v.kid == "k1"
 
 
+@pytest.mark.req("VER-016")
 def test_missing_headers():
     _, res = _ps()
     with pytest.raises(SignatureError) as e:
@@ -120,7 +121,7 @@ def test_missing_headers():
     assert e.value.error == "invalid_signature" and e.value.status == 401
 
 
-@pytest.mark.req("SUP-011")
+@pytest.mark.req("SUP-011", "VER-016")
 def test_required_components():
     key, res = _ps()
     req = _signed(key, names=["@method", "@authority", "@path", "signature-key"])
@@ -129,6 +130,7 @@ def test_required_components():
     assert e.value.error == "invalid_input"
 
 
+@pytest.mark.req("VER-017")
 def test_window_and_skew():
     key, res = _ps()
     now = int(time.time())
@@ -153,6 +155,7 @@ def test_tampered_body_and_signature():
     assert e.value.error == "invalid_signature"
 
 
+@pytest.mark.req("VER-008", "VER-018")
 def test_wrong_scheme():
     key, res = _ps()
     req = _signed(key, sk='sig=hwk;kty="OKP";crv="Ed25519";x="AA";alg="Ed25519"')
@@ -162,6 +165,7 @@ def test_wrong_scheme():
     assert e.value.headers["Accept-Signature-Scheme"] == "jwks_uri"
 
 
+@pytest.mark.req("VER-008", "VER-019")
 def test_wrong_dwk_and_unknown_kid():
     key, res = _ps()
     req = _signed(key, sk='sig=jwks_uri;id="https://ps.example";dwk="aauth-agent.json";kid="k1"')
@@ -173,7 +177,7 @@ def test_wrong_dwk_and_unknown_kid():
     assert e.value.error == "unknown_key"
 
 
-@pytest.mark.req("SUP-030")
+@pytest.mark.req("SUP-030", "REF-019", "REF-020", "VER-019")
 def test_issuer_mismatch_and_missing():
     key = SigningKey.generate("k1")
     for meta, code in (({"issuer": "https://evil.example", "jwks_uri": f"{PS}/jwks"},
@@ -185,6 +189,7 @@ def test_issuer_mismatch_and_missing():
         assert e.value.error == code
 
 
+@pytest.mark.req("VER-030")
 def test_cross_origin_jwks_refused():
     key = SigningKey.generate("k1")
     res = JwksUriResolver(StaticFetcher({
@@ -200,6 +205,7 @@ def test_cross_origin_jwks_refused():
     ({"kty": "oct", "k": "AA", "alg": "HS256"}, "unsupported_algorithm"),
     ({"kty": "EC", "crv": "P-256", "x": "AA", "y": "AA", "alg": "Ed25519"}, "invalid_key"),
 ])
+@pytest.mark.req("VER-002", "VER-003", "VER-004", "VER-005")
 def test_algorithm_determination(jwk, code):
     with pytest.raises(SignatureError) as e:
         key_from_jwk(jwk)
@@ -293,6 +299,7 @@ def test_response_malformed_members():
     assert "malformed signature members" in e.value.detail
 
 
+@pytest.mark.req("VER-030")
 def test_egress_refuses_http_and_private():
     f = HttpsFetcher(EgressPolicy(timeout=1))
     with pytest.raises(FetchError):

@@ -1,6 +1,6 @@
 """Minimal RFC 9651 Structured Field Values for the headers AAuth uses.
 
-Covers Dictionary, List, Inner List, Item and Parameters with the bare item
+Covers Dictionary, Inner List, Item and Parameters with the bare item
 types Integer, Decimal, String, Token, Byte Sequence and Boolean. Enough for
 Signature-Input, Signature, Signature-Key, Signature-Error, Accept-Signature
 and Content-Digest. Parsing is strict: any syntax error raises SFVError.
@@ -136,7 +136,7 @@ class _Parser:
         self.i = end + 1
         if not re.fullmatch(r"[A-Za-z0-9+/=]*", raw):
             raise SFVError("bad base64")
-        if "=" not in raw:  # RFC 8941 4.2.7: parsers SHOULD NOT fail when padding is absent
+        if "=" not in raw:  # RFC 9651 4.2.7: parsers SHOULD NOT fail when padding is absent
             raw += "=" * (-len(raw) % 4)
         try:
             return base64.b64decode(raw, validate=True)
@@ -184,13 +184,17 @@ class _Parser:
         return self.inner_list() if self.peek() == "(" else self.item()
 
 
-def parse_dictionary(text: str) -> dict[str, Member]:
+def parse_dictionary(text: str, unique: bool = False) -> dict[str, Member]:
+    """RFC 9651 4.2.2. A key given twice keeps its last value, as the RFC says; with
+    `unique`, it fails instead (for a field whose readers may take the first)."""
     p = _Parser(text.strip(" "))
     out: dict[str, Member] = {}
     if p.eof():
         return out
     while True:
         k = p.key()
+        if unique and k in out:
+            raise SFVError(f"key {k!r} given twice")
         if p.peek() == "=":
             p.i += 1
             out[k] = p.member()

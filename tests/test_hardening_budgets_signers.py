@@ -36,7 +36,7 @@ def test_unreadable_or_negative_amount_is_not_counted(amount):
     assert d.decision == "ask"  # the budget cannot be checked, so the person is asked
 
 
-def test_negative_history_cannot_open_the_ceiling():
+def test_readable_amounts_count_and_one_over_the_ceiling_is_denied():
     pol = Policy(policy_cfg())
     assert pol.classify(_pay(600_000)).amount == 600_000
     assert pol.classify(_pay(2.0)).amount == 2 and pol.classify(_pay("7")).amount == 7

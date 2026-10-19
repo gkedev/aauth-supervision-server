@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from .errors import SignatureError
+from .errors import ProtocolError, SignatureError
 from .jwk import SigningKey, VerifyKey
 from .sfv import (
     InnerList,
@@ -60,7 +62,9 @@ def check_content_digest(value: str | None, body: bytes) -> bool:
     if value is None:
         return False
     try:
-        d = parse_dictionary(value)
+        # One digest per algorithm: a parser keeps the last of two, a reader of the logged
+        # request may take the first, and a signed answer covers the whole field.
+        d = parse_dictionary(value, unique=True)
     except SFVError:
         return False
     seen = False
@@ -90,6 +94,15 @@ def _component_value(it: Item, req: HttpRequest, resp: HttpResponse | None) -> s
     name = it.value
     if not isinstance(name, str):
         raise SignatureError("invalid_input", "component identifier must be a string")
+    # RFC 9421 Section 2.5: a component parameter "that is unknown or does not apply to
+    # the component identifier" MUST produce an error. This verifier implements `req`
+    # alone (`sf`, `key`, `bs`, `name`, `tr` are not), and `req` applies only to a
+    # request component covered in a response.
+    if any(p != "req" for p in it.params) or (
+            "req" in it.params and (resp is None or it.params["req"] is not True)):
+        raise SignatureError("invalid_input",
+                             f"unsupported component parameter on {name}: "
+                             f"{', '.join(sorted(it.params))}")
     use_req = resp is None or it.params.get("req") is True
     if name.startswith("@"):
         if name == "@status":
@@ -113,7 +126,8 @@ def _component_value(it: Item, req: HttpRequest, resp: HttpResponse | None) -> s
     v = msg.header(name)
     if v is None:
         raise SignatureError("invalid_input", f"covered header {name} is absent")
-    return " ".join(v.strip().split()) if "\n" in v else v.strip()
+    # RFC 9421 Section 2.1: an obs-fold becomes one space; nothing else in the value changes.
+    return re.sub(r"\r?\n[ \t]+", " ", v).strip()
 
 
 def signature_base(components: InnerList, req: HttpRequest,
@@ -181,23 +195,6 @@ def sign_message(names: list[str], key: SigningKey, signature_key_value: str,
 # ------------------------------------------------------------------ verification
 
 
-# RFC 9421 HTTP Signature Algorithms registry names for the JWS algs this SS accepts.
-_RFC9421_ALG = {"Ed25519": "ed25519", "ES256": "ecdsa-p256-sha256"}
-
-
-def _check_alg_param(comps: InnerList, key: VerifyKey) -> None:
-    """RFC 9421 3.2: an `alg` parameter, when present, must match the key's algorithm.
-
-    The algorithm comes from the key (Signature-Key, Algorithm Determination); a
-    signature that claims a different one is refused rather than verified anyway.
-    """
-    alg = comps.params.get("alg")
-    if alg is None:
-        return
-    if not isinstance(alg, str) or alg != _RFC9421_ALG.get(key.alg):
-        raise SignatureError("invalid_signature", f"alg {alg!r} does not match the key")
-
-
 class KeyResolver(Protocol):
     def resolve(self, signer_id: str, dwk: str, kid: str, now: float | None = None) -> VerifyKey: ...
 
@@ -210,16 +207,25 @@ class VerifiedSigner:
     label: str
     created: int
     covered: frozenset[str]
+    received: float = 0.0  # the verifier's clock when it checked `created`
 
 
 def verify_request(req: HttpRequest, resolver: KeyResolver, *, required: list[str],
                    window: int = 60, now: float | None = None,
-                   expected_dwk: str | None = "aauth-person.json") -> VerifiedSigner:
-    """Core, Verification (Server), for a server signer under the jwks_uri scheme."""
+                   expected_dwk: str | None = "aauth-person.json",
+                   admit: Callable[[str], None] | None = None) -> VerifiedSigner:
+    """Core, Verification (Server), for a server signer under the jwks_uri scheme.
+
+    `admit(id)` is called with the signer's id before its keys are discovered, and
+    raises to refuse a signer the verifier does not accept: no fetch is made for it."""
     now = time.time() if now is None else now
     si, sg, sk = req.header("signature-input"), req.header("signature"), req.header("signature-key")
     if not (si and sg and sk):
         raise SignatureError("invalid_signature", "Signature, Signature-Input and Signature-Key required")
+    if max(len(si), len(sg), len(sk)) > MAX_SIGNATURE_FIELD:
+        # Parsing walks every byte before anything is checked; an honest field of up to
+        # MAX_LABELS signatures is a few hundred bytes each.
+        raise SignatureError("invalid_signature", "signature field too long")
     try:
         d_si, d_sg, d_sk = parse_dictionary(si), parse_dictionary(sg), parse_dictionary(sk)
     except SFVError as e:
@@ -232,22 +238,27 @@ def verify_request(req: HttpRequest, resolver: KeyResolver, *, required: list[st
     # Signature-Key -09 Section 3.2 allows several signatures per message. Evaluate each
     # complete label and accept the first that verifies, so an added label can neither
     # replace nor mask the one the server needs. The first failure is reported.
-    errors: list[SignatureError] = []
+    # A signer the verifier does not accept (`admit` refuses it) fails its label only.
+    errors: list[ProtocolError] = []
     for label in labels:
         try:
             return _verify_label(req, resolver, label, d_si, d_sg, d_sk, required=required,
-                                 window=window, now=now, expected_dwk=expected_dwk)
-        except SignatureError as e:
+                                 window=window, now=now, expected_dwk=expected_dwk,
+                                 admit=admit)
+        except ProtocolError as e:
             errors.append(e)
     raise errors[0]
 
 
 MAX_LABELS = 4
+# The longest Signature, Signature-Input or Signature-Key field parsed, in characters.
+MAX_SIGNATURE_FIELD = 8192
 
 
 def _verify_label(req: HttpRequest, resolver: KeyResolver, label: str, d_si: Any, d_sg: Any,
                   d_sk: Any, *, required: list[str], window: int, now: float,
-                  expected_dwk: str | None) -> VerifiedSigner:
+                  expected_dwk: str | None,
+                  admit: Callable[[str], None] | None = None) -> VerifiedSigner:
     comps, sigm, keym = d_si[label], d_sg[label], d_sk[label]
     if not isinstance(comps, InnerList) or not isinstance(sigm, Item) or \
             not isinstance(sigm.value, bytes) or not isinstance(keym, Item):
@@ -266,7 +277,11 @@ def _verify_label(req: HttpRequest, resolver: KeyResolver, label: str, d_si: Any
     if created > now + window:
         raise SignatureError("clock_skew", "created is ahead of the server clock")
     expires = comps.params.get("expires")
-    if isinstance(expires, int) and not isinstance(expires, bool) and expires < now:
+    if "expires" in comps.params and (not isinstance(expires, int) or isinstance(expires, bool)):
+        # RFC 9421 Section 2.3: "expires: Expiration time as a UNIX timestamp value of type
+        # Integer". Another type is a malformed parameter, not an absent one.
+        raise SignatureError("invalid_signature", "expires is not an Integer")
+    if isinstance(expires, int) and expires < now:
         raise SignatureError("invalid_signature", "signature expired")
     scheme = keym.value
     if not isinstance(scheme, Token) or scheme.value != "jwks_uri":
@@ -280,12 +295,19 @@ def _verify_label(req: HttpRequest, resolver: KeyResolver, label: str, d_si: Any
         raise SignatureError("invalid_key", f"dwk {dwk!r}, expected {expected_dwk!r}")
     if req.body and not check_content_digest(req.header("content-digest"), req.body):
         raise SignatureError("invalid_signature", "Content-Digest does not match the body")
+    if admit is not None:
+        admit(sid)
     key = resolver.resolve(sid, dwk, kid, now)
-    _check_alg_param(comps, key)
+    # Protocol L2236: verifiers "MUST ignore" an `alg` parameter; the key decides.
     base = signature_base(comps, req)
     if not key.verify(sigm.value, base):
-        raise SignatureError("invalid_signature", "signature does not verify")
-    return VerifiedSigner(sid, dwk, kid, label, created, frozenset(covered))
+        # Protocol L2286: a cached key that fails is refreshed once and the signature
+        # tried again (a key replaced under its kid), within the fetch floor.
+        refresh = getattr(resolver, "refresh", None)
+        fresh = refresh(sid, dwk, kid, now) if callable(refresh) else key
+        if fresh == key or not fresh.verify(sigm.value, base):
+            raise SignatureError("invalid_signature", "signature does not verify")
+    return VerifiedSigner(sid, dwk, kid, label, created, frozenset(covered), now)
 
 
 def verify_response(resp: HttpResponse, req: HttpRequest, key: VerifyKey,
@@ -330,7 +352,7 @@ def verify_response(resp: HttpResponse, req: HttpRequest, key: VerifyKey,
         raise SignatureError("invalid_input", f"response does not cover {missing}")
     if not check_content_digest(resp.header("content-digest"), resp.body):
         raise SignatureError("invalid_signature", "response Content-Digest mismatch")
-    _check_alg_param(comps, key)
+    # Protocol L2236: an `alg` parameter is ignored here too.
     if not isinstance(sigm.value, bytes) or not key.verify(sigm.value,
                                                            signature_base(comps, req, resp)):
         raise SignatureError("invalid_signature", "response signature does not verify")

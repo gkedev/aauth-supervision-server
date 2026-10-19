@@ -125,7 +125,7 @@ def test_a_non_string_recipient_is_not_visible() -> None:
     assert c.cls == "send" and c.uncertain  # unknown, so the conservative fallback
 
 
-def test_domain_uses_the_last_at_and_ignores_display_brackets() -> None:
+def test_a_second_at_is_outside_and_display_brackets_are_read() -> None:
     p = pol(rules=[Rule(cls="exfil", param_domain_not_in={"to": ["corp.example"]}),
                    Rule(cls="read")])
     assert p.classify(act(parameters={"to": "Alice <a@Corp.Example>"})).cls == "read"
@@ -154,7 +154,9 @@ def test_agent_data_cannot_lower_a_class() -> None:
                    Rule(cls="send", if_unknown="send")])
     c = p.classify(act(act="permission", resource="", tool="Mail",
                        parameters_provenance="agent", parameters={"to": "a@corp"}))
-    assert (c.cls, c.provenance, c.uncertain) == ("send", "agent", True)
+    # With the read rule set aside the static rule gives `send` whatever the data: the
+    # agent's claim cannot make that certain class uncertain either.
+    assert (c.cls, c.uncertain) == ("send", False)
 
 
 def test_agent_data_that_does_not_change_the_class_keeps_its_provenance() -> None:
@@ -276,13 +278,14 @@ def test_certain_composition_is_denied_with_the_certain_message() -> None:
     p = pol(rules=[Rule(cls="send")], prohibited_pairs=[("read", "send")])
     d = p.decide(act(), mission(), [h("read")], [], now=0)
     assert d.decision == "deny"
-    assert d.reason == "This act would complete a prohibited composition: read then send."
+    assert d.reason == ("Together with other acts, this act would complete a combination "
+                        "the policy forbids: `read`, then `send`.")
 
 
 def test_uncertain_composition_is_asked() -> None:
     p = pol(rules=[Rule(cls="send")], prohibited_pairs=[("read", "send")])
     d = p.decide(act(), mission(), [h("read", uncertain=True)], [], now=0)
-    assert d.decision == "ask" and "cannot rule it out" in d.summary
+    assert d.decision == "ask" and "neither confirm nor rule it out" in d.summary
 
 
 # --------------------------------------------------------------------- reach
@@ -326,7 +329,8 @@ def test_reach_mission_scope_and_composition_override() -> None:
 
 def test_allow_trace_records_the_reach_that_applied() -> None:
     p = pol(rules=[Rule(cls="send")], high_impact={"send"})
-    d = p.decide(act(parameters_provenance="agent"), mission(), [], [reach()], now=0)
+    d = p.decide(act(parameters_provenance="agent"), mission(), [], [reach(gate="high_impact")],
+                 now=0)
     assert d.decision == "allow" and "reach mission" in d.trace
 
 
@@ -351,7 +355,7 @@ def test_ask_offers_reach_on_the_resource() -> None:
     d = pol(rules=[Rule(cls="read")]).decide(act(resource="https://other.example"), mission(),
                                               [], [], now=0)
     labels = [o["label"] for o in d.apply_options]
-    assert "Acts like this on https://other.example for this mission" in labels
+    assert "`read` acts by this agent on https://other.example, for the rest of this mission" in labels
 
 
 def test_clarify_is_the_default_for_high_impact_without_justification() -> None:
@@ -385,8 +389,8 @@ def test_proposal_names_the_tools_it_asks_about() -> None:
     p = pol(ask_tools=["Bash"])
     d = p.decide_proposal({"resources": [], "tools": [{"name": "Bash"}, {"name": "Read"}]},
                           now=0)
-    assert d.decision == "ask" and "tools that need your approval: Bash." in d.summary
-
+    assert d.decision == "ask" and ("refinement leaves out tools that need your approval, so approving "
+                                    "it as proposed does not grant them: `Bash`.") in d.summary
 
 
 # ------------------------------------------------------------ pinned by mutation testing
@@ -403,11 +407,38 @@ def test_a_result_decided_on_resource_evidence_takes_no_agent_fallback() -> None
     assert (c.cls, c.provenance, c.uncertain) == ("read", "resource", False)
 
 
-@pytest.mark.parametrize("addr,dom", [
-    ("a@corp.example", "corp.example"), ("A <x@Corp.Example>", "corp.example"),
-    ("a@b@evil.example", "evil.example"), ("corp.example", "corp.example"),
+@pytest.mark.parametrize("addr,doms", [
+    ("a@corp.example", ["corp.example"]), ("A <x@Corp.Example>", ["corp.example"]),
+    ("a@b@evil.example", ["b@evil.example"]), ("corp.example", ["corp.example"]),
+    ("a@x.example, b@y.example; c@z.example", ["x.example", "y.example", "z.example"]),
+    ('"Doe, J" <j@x.example>,,', ["x.example"]), ("", [""]),
 ])
-def test_the_domain_of_an_address_is_after_its_last_at(addr: str, dom: str) -> None:
-    from aauth_supervision_server.policy import _domain
+def test_the_domains_an_address_names(addr: str, doms: list[str]) -> None:
+    # "" is a recipient that cannot be read, and a domain with a stray `@` is no domain:
+    # no listed domain matches either.
+    from aauth_supervision_server.policy import _domains
 
-    assert _domain(addr) == dom
+    assert _domains(addr) == doms
+
+
+@pytest.mark.parametrize("result", [
+    {"contains": "salary"},              # `contains` that is not a list
+    {"categories": ["salary"]},          # contents in a member the rule does not read
+    {"records": 214},                    # no contents declared at all
+])
+def test_a_result_the_rule_cannot_read_is_not_visible(result: dict[str, Any]) -> None:
+    # R3 L653: the members of `result` are the resource's. Only a `contains` list declares
+    # what the result holds; without one, nothing rules out sensitive contents.
+    p = pol(rules=[Rule(cls="exfil", result_contains_any=["salary"]),
+                   Rule(cls="read", if_unknown="exfil")])
+    c = p.classify(act(result=result))
+    assert (c.cls, c.uncertain) == ("exfil", True)
+
+
+def test_a_declared_contents_list_or_a_matching_member_decides() -> None:
+    p = pol(rules=[Rule(cls="exfil", result_contains_any=["salary"]),
+                   Rule(cls="read", if_unknown="exfil")])
+    assert p.classify(act(result={"contains": ["names"]})).cls == "read"
+    assert p.classify(act(result={"contains": []})).cls == "read"
+    assert p.classify(act(result={"salary": 5})).cls == "exfil"
+    assert p.classify(act(result={"contains": ["names"], "salary": 5})).cls == "exfil"

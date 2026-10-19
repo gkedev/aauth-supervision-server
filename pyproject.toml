@@ -1,20 +1,20 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "aauth-supervision-server"
-version = "0.1.0"
+version = "0.2.0"
 description = "Independent AAuth Supervision Server (AAuth Supervision -00) with a deterministic, composition-aware policy (Agentic Principal Chain model)"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{name = "Xabier Muruaga"}]
 keywords = ["aauth", "authorization", "agents", "supervision", "ietf"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -41,6 +41,8 @@ dev = [
     "mypy==1.11.2",
     # An independent AAuth signature implementation, for tests/test_interop_regent_httpsig.py.
     "regent-httpsig==0.7.1",
+    # Its dependency, pinned: 0.7.1 imports `http_sfv` from it, which 2.1.0 no longer exports.
+    "http-message-signatures==2.0.1",
     "httpx==0.28.1",
 ]
 

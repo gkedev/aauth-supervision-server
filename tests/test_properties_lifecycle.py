@@ -5,9 +5,9 @@ clarifications, terminal asks and allows, retries, polls, withdrawals, the clock
 person's `decision.resolved`. Hypothesis drives the real server with random sequences of
 those operations and checks each answer, and the stored decision, against the model.
 
-Two defects found during development are lifecycle bugs of exactly this shape: a DELETE after the
-answer rewrote the answer (SUP-P17), and an unanswered clarification never timed out
-(SUP-P15). Re-introducing either one makes this test fail.
+The model catches two lifecycle defects of exactly this shape: a DELETE after the answer
+rewriting the answer (SUP-P17), and an unanswered clarification never timing out
+(SUP-P15). Reintroducing either one makes this test fail.
 """
 from __future__ import annotations
 
@@ -36,8 +36,9 @@ class Req:
     state: str = "terminal"  # clarify: "open" | "answered" | "withdrawn" | "expired"
     location: str = ""
     deadline: float = 0.0
-    answer: bytes = b""      # the terminal body every later poll or retry must repeat
+    answer: bytes = b""      # the terminal body every later retry must repeat
     signature: str = ""      # the signature a retry at /decision must repeat (L316)
+    gone: bool = False       # the pending URL returned a terminal response: 410 (L2840)
 
 
 class Lifecycle(RuleBasedStateMachine):
@@ -46,7 +47,13 @@ class Lifecycle(RuleBasedStateMachine):
 
     def __init__(self) -> None:
         super().__init__()
-        self.ss, self.ps, self.clock = make_env(clarify_missing_justification=True)
+        # No compositions: this model is about the lifecycle of each request, so the kinds
+        # must not affect each other. With the example policy's pair and sequence, an open
+        # act (a question being answered, an allow not yet reported issued) rightly turns
+        # a later act it composes with into an ask; that is tested in test_open_acts.py
+        # and test_properties_open_acts.py.
+        self.ss, self.ps, self.clock = make_env(clarify_missing_justification=True,
+                                                prohibited_pairs=[], prohibited_sequences=[])
         self.s256 = connected((self.ss, self.ps, self.clock), resources=(HR, MAIL))
         self.all: list[Req] = []
 
@@ -91,43 +98,48 @@ class Lifecycle(RuleBasedStateMachine):
 
     # ------------------------------------------------------------ the pending URL
 
+    # Protocol L2840: "Once a terminal response is returned, the pending URL MUST return
+    # `410 Gone`". The answer to a clarification reply and a 408 `expired` (terminal, L2414)
+    # are terminal responses; a DELETE leaves the URL gone too (L1121).
+
     @rule(r=questions)
     def answer(self, r: Req) -> None:
         self._expire_if_due(r)
         resp = self._call("POST", r.location, {"action": "clarification_response",
                                                "clarification_response": "for the report"})
-        if r.state == "open":
-            assert resp.status == 200 and resp.json()["decision"] == "ask"
-            r.state, r.record, r.answer = "answered", "ask", resp.body
-        elif r.state == "answered":
-            assert resp.status == 200 and resp.body == r.answer
-        elif r.state == "withdrawn":
+        if r.gone or r.state == "withdrawn":
             assert resp.status == 410
+        elif r.state == "open":
+            assert resp.status == 200 and resp.json()["decision"] == "ask"
+            r.state, r.record, r.answer, r.gone = "answered", "ask", resp.body, True
         else:
             assert resp.status == 408 and resp.json()["error"] == "expired"
+            r.gone = True
 
     @rule(r=questions)
     def poll(self, r: Req) -> None:
         self._expire_if_due(r)
         resp = self._call("GET", r.location)
-        assert resp.status == {"open": 202, "answered": 200, "withdrawn": 410,
-                               "expired": 408}[r.state]
-        if r.state == "answered":
-            assert resp.body == r.answer
+        if r.gone or r.state == "withdrawn":
+            assert resp.status == 410
+        elif r.state == "open":
+            assert resp.status == 202
+        else:
+            assert resp.status == 408
+            r.gone = True
 
     @rule(r=questions)
     def withdraw(self, r: Req) -> None:
         self._expire_if_due(r)
         resp = self._call("DELETE", r.location)
-        if r.state == "expired":
-            assert resp.status == 408
-        elif r.state == "withdrawn":
+        if r.gone or r.state == "withdrawn":
             assert resp.status == 410
+        elif r.state == "expired":
+            assert resp.status == 408
+            r.gone = True
         else:
             assert resp.status == 204
-            if r.state == "open":
-                r.record = "abandoned"
-            r.state = "withdrawn"  # an answered record keeps its answer (SUP-P17)
+            r.record, r.state = "abandoned", "withdrawn"
 
     # ------------------------------------------------------------ retries and events
 
@@ -147,8 +159,17 @@ class Lifecycle(RuleBasedStateMachine):
                             expected_issuer="https://ss.example", window=None)
             if r.signature:
                 assert resp.headers["Signature"] == r.signature
-        else:  # open, withdrawn or expired question: the same pending URL
-            assert resp.status == 202 and resp.headers["Location"] == r.location
+            return
+        self._expire_if_due(r)
+        assert resp.status == 202
+        if r.state == "open":  # an open question: the same pending URL
+            assert resp.headers["Location"] == r.location
+        else:
+            # A question that is over (withdrawn, timed out) answered nothing: the request
+            # is decided again under its sdi, and asks again at a new pending URL.
+            assert resp.headers["Location"] != r.location
+            r.state, r.location, r.record = "open", resp.headers["Location"], "clarify"
+            r.deadline, r.gone = self.clock() + TIMEOUT, False
 
     # `apply` stays within reaches that do not change later decisions ("bogus" was not
     # offered, so it counts as once), so each kind of request keeps its expected answer.

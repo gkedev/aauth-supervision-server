@@ -32,6 +32,11 @@ class Clock:
 
 def policy_cfg(**over) -> PolicyConfig:
     d = json.loads((ROOT / "examples" / "policy.json").read_text())
+    # The example has records.example serve on a person token alone, which makes approving
+    # any mission naming it an act (the token the PS issues at approval). Most tests use
+    # records.example as a sensitive resource read through auth tokens; the tests about
+    # Person Identity Access name `serves_on_identity` themselves.
+    d["serves_on_identity"] = []
     d.update(over)
     return PolicyConfig.from_dict(d)
 

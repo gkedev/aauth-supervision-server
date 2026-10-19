@@ -1,4 +1,4 @@
-"""Adversarial suite: what a Supervision Server can decide, under three configurations.
+"""Adversarial suite: what a Supervision Server can decide, under four configurations.
 
 Each scenario is a short mission. The agent may be compromised (it lies in its
 justification, or asserts parameters). The last act of each scenario is the
@@ -14,13 +14,14 @@ Configurations:
                       change AAuth #256 asks for).
   * ``apc/forwarded+issued`` as above, and the proposal (with any released
                       ``result``) also carried in ``auth_token.issued``, so it survives
-                      replay to a new SS (the change the follow-up issue asks for).
+                      replay to a new SS (the change AAuth #257 asks for).
 
 Outcome of the critical act against its ideal:
-  * ``correct``    the SS decided it, as intended, with no person involved;
+  * ``correct``    the SS gave the intended answer (an allow or a deny with no person
+                   involved, or an ask where asking is the intended answer);
   * ``escalated``  the SS asked the person (safe only if the person sees through it);
   * ``unsafe``     the SS allowed an act that should be denied or asked;
-  * ``blocked``    the SS denied an act that should be allowed.
+  * ``blocked``    the SS denied an act that should be allowed or asked.
 
 Steps before the critical act that the SS asks about are approved by the person
 ("once"), as a cooperative person would; each one is counted as a prompt.

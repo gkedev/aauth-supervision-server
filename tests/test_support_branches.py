@@ -1,10 +1,9 @@
 """The remaining paths in the support modules, each pinned to its observable effect.
 
 Command line, listener, keys, key discovery, Structured Fields, signature bases, the
-snapshot loader and three policy edges. Two of them were defects, fixed alongside: a
-mission `expires_at` that was malformed or had no UTC offset read as "no expiry"
-(it now fails closed), and Structured Fields swallowed every exception while decoding
-a byte sequence (it now catches only the decoding error).
+snapshot loader and three policy edges, among them: a mission `expires_at` that is
+malformed or has no UTC offset fails closed, and decoding a Structured Fields byte
+sequence catches only the decoding error.
 """
 from __future__ import annotations
 
@@ -86,12 +85,29 @@ def test_build_server_refuses_a_policy_with_problems() -> None:
         cli.build_server(example("server.json"), pol, None, None)
 
 
-@pytest.mark.parametrize("egress", [{"allow_private_hosts": "localhost"},
-                                    {"allow_cross_origin_jwks": "yes"}])
+@pytest.mark.parametrize("egress", [
+    {"allow_private_hosts": "localhost"}, {"allow_private_hosts": ["localhost", 1]},
+    {"allow_cross_origin_jwks": "yes"},
+    # A timeout or size every fetch fails under, or one a fetch cannot use.
+    {"timeout": "5"}, {"timeout": True}, {"timeout": 0}, {"timeout": -1}, {"timeout": 1e308},
+    {"timeout": float("nan")}, {"timeout": 301},
+    {"max_bytes": "262144"}, {"max_bytes": True}, {"max_bytes": 0}, {"max_bytes": 1.5},
+    {"max_bytes": 64 * 1024 * 1024 + 1},
+])
 def test_build_server_refuses_mistyped_egress(egress: dict[str, Any]) -> None:
     cfg = example("server.json") | {"egress": egress}
-    with pytest.raises(ValueError, match="^server config: egress has the wrong types$"):
+    with pytest.raises(ValueError,
+                       match="^server config: egress has a member of the wrong type or out of range$"):
         cli.build_server(cfg, example("policy.json"), None, None)
+
+
+@pytest.mark.parametrize("egress", [{"timeout": 0.5}, {"timeout": 300}, {"max_bytes": 1},
+                                    {"max_bytes": 64 * 1024 * 1024}])
+def test_build_server_takes_egress_limits_in_range(egress: dict[str, Any]) -> None:
+    cfg = example("server.json") | {"egress": egress}
+    ss = cli.build_server(cfg, example("policy.json"), None, None)
+    (k, v), = egress.items()
+    assert getattr(ss.resolver.policy, k) == v
 
 
 def test_the_admin_token_can_come_from_the_environment(monkeypatch: Any) -> None:
@@ -101,6 +117,8 @@ def test_the_admin_token_can_come_from_the_environment(monkeypatch: Any) -> None
 
 
 class FakeHttpd:
+    server_address = ("127.0.0.1", 8443)
+
     def __init__(self) -> None:
         self.closed = False
         self.log_during: tuple[int, int] = (0, 0)
@@ -122,6 +140,7 @@ def test_serve_runs_until_interrupted_and_cleans_up(monkeypatch: Any, capsys: An
 
     def fake_serve(ss: Any, host: str, port: int) -> FakeHttpd:
         seen.update(ss=ss, host=host, port=port)
+        fake.server_address = (host, port)  # type: ignore[assignment]
         return fake
 
     monkeypatch.setattr(hs, "serve", fake_serve)
@@ -141,6 +160,7 @@ def test_serve_runs_until_interrupted_and_cleans_up(monkeypatch: Any, capsys: An
 
 def test_serve_with_a_key_does_not_warn(monkeypatch: Any, capsys: Any, tmp_path: Path) -> None:
     import aauth_supervision_server.http_server as hs
+    monkeypatch.setenv("AAUTH_SS_ADMIN_TOKEN", "operator-secret")  # set up as the README says
 
     monkeypatch.setattr(hs, "serve", lambda ss, host, port: FakeHttpd())
     key = tmp_path / "k.json"
@@ -187,14 +207,16 @@ def test_a_chunked_request_is_refused_and_the_connection_closed(live: Any) -> No
             reply += chunk
     head, _, body = reply.partition(b"\r\n\r\n")
     assert head.startswith(b"HTTP/1.1 411 ")
-    assert b"\r\nConnection: close" in head and body == b"Content-Length required\n"
+    assert b"\r\nConnection: close" in head
+    assert body == b'{"error":"invalid_request","detail":"Content-Length required"}'
 
 
 def test_a_reply_without_a_body_sends_no_body(live: Any) -> None:
     ss, ps, port = live
     ps.connect(ss, SUB)
     req = ps.build("POST", "/event", {"event": "person_token.issued", "id": "e-1", "iat": 1,
-                                      "sub": SUB, "agent": AGENT})
+                                      "sub": SUB, "agent": AGENT,
+                                      "aud": "https://mail.example"})
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
     conn.request("POST", req.path, body=req.body, headers=dict(req.headers) | {
         "host": req.authority})
@@ -225,6 +247,7 @@ def test_handle_error_is_silent_only_for_dropped_connections(capsys: Any) -> Non
 @pytest.mark.parametrize("exc", [ConnectionResetError, BrokenPipeError, TimeoutError])
 def test_a_connection_dropped_mid_request_ends_the_connection(exc: type[OSError]) -> None:
     """Deterministic: the socket tests hit this path only when the OS timing allows."""
+    from aauth_supervision_server import http_server
     from aauth_supervision_server.http_server import make_handler
 
     class Dropped:
@@ -234,6 +257,7 @@ def test_a_connection_dropped_mid_request_ends_the_connection(exc: type[OSError]
     ss, _, _ = make_env()
     handler = object.__new__(make_handler(ss))
     handler.rfile = Dropped()  # type: ignore[assignment]
+    handler._reads = http_server._DeadlineReader(None)  # type: ignore[arg-type]
     handler.client_address = ("127.0.0.1", 1)  # the stdlib logs a read timeout itself
     handler.close_connection = False
     handler.handle_one_request()
@@ -290,7 +314,8 @@ def test_algorithm_determination_refuses_each_inconsistent_jwk() -> None:
     assert e.value.headers.get("Accept-Signature-Alg") is None
     with pytest.raises(SignatureError) as e:
         key_from_jwk(ec_jwk | {"alg": "ES384"})
-    assert e.value.headers["Accept-Signature-Alg"] == '"Ed25519", "ES256"'
+    # Signature-Key 4.2: "a List ... of Tokens", e.g. "Accept-Signature-Alg: Ed25519, ES256".
+    assert e.value.headers["Accept-Signature-Alg"] == "Ed25519, ES256"
 
 
 @pytest.mark.parametrize("alg", ["Ed25519", "ES256"])
@@ -336,7 +361,7 @@ def test_a_rotated_key_is_found_by_one_refetch() -> None:
     r, f = resolver(docs)
     r.resolve(SIGNER, "aauth-person.json", "k1", now=1000.0)
     docs[f"{SIGNER}/jwks"] = {"keys": [new.public_jwk()]}
-    assert r.resolve(SIGNER, "aauth-person.json", "k2", now=1031.0).jwk["x"] == \
+    assert r.resolve(SIGNER, "aauth-person.json", "k2", now=1060.0).jwk["x"] == \
         new.public_jwk()["x"]
     assert f.calls.count(f"{SIGNER}/jwks") == 2
 
@@ -365,8 +390,7 @@ def test_plain_http_only_for_hosts_admitted_for_testing() -> None:
 
 @pytest.mark.parametrize("docs,detail", [
     ({META: {"issuer": SIGNER, "jwks_uri": 5}}, "metadata has no jwks_uri"),
-    ({META: {"issuer": SIGNER, "jwks_uri": f"{SIGNER}/jwks"}}, "JWKS fetch failed: no document "
-                                                              f"at {SIGNER}/jwks"),
+    ({META: {"issuer": SIGNER, "jwks_uri": f"{SIGNER}/jwks"}}, "JWKS fetch failed"),
     ({META: {"issuer": SIGNER, "jwks_uri": f"{SIGNER}/jwks"}, f"{SIGNER}/jwks": [1]},
      "JWKS is not an object"),
 ])
@@ -403,7 +427,7 @@ def test_byte_sequence_with_bad_padding_is_an_sfv_error(raw: str) -> None:
 @pytest.mark.parametrize("raw,value", [(":YWJj:", b"abc"), (":YWI:", b"ab"), (":YQ:", b"a"),
                                        (":YQ==:", b"a")])
 def test_byte_sequence_without_padding_is_accepted(raw: str, value: bytes) -> None:
-    # RFC 8941 4.2.7: "parsers SHOULD NOT fail when '=' padding is not present".
+    # RFC 9651 4.2.7: "parsers SHOULD NOT fail when '=' padding is not present".
     assert parse_item(raw).value == value
 
 
@@ -498,7 +522,7 @@ def test_server_error_is_a_500_problem() -> None:
 # ------------------------------------------------------------------ snapshots
 
 
-def test_a_snapshot_written_before_a_member_existed_loads_with_its_default(
+def test_a_snapshot_missing_a_member_loads_with_its_default(
         tmp_path: Path) -> None:
     path = tmp_path / "state.json"
     ss, ps, c = make_env(clarify_missing_justification=True)
@@ -557,3 +581,90 @@ def test_a_proposed_tool_in_neither_list_is_left_out() -> None:
                              "tools": [{"name": "WebSearch"}, {"name": "Teleport"}]}, now=0.0)
     assert d.decision == "allow"
     assert d.narrow["approved_tools"] == [{"name": "WebSearch"}]
+
+
+def test_a_failed_key_fetch_tells_the_signer_nothing_of_the_ss_s_network(
+        caplog: pytest.LogCaptureFixture) -> None:
+    # Why a fetch failed (an address the SS resolved, a name it could not) is for the
+    # operator's log, not for whoever signed the request: under open registration that is
+    # anyone.
+    from aauth_supervision_server.egress import FetchError
+
+    class Refusing(StaticFetcher):
+        def fetch_json(self, url: str) -> Any:
+            raise FetchError("destination localhost -> ::1 is not public")
+    r = JwksUriResolver(Refusing(), EgressPolicy())
+    with caplog.at_level(logging.WARNING, logger="aauth_supervision_server"):
+        with pytest.raises(SignatureError) as e:
+            r.resolve(SIGNER, "aauth-person.json", "k", now=1.0)
+    assert (e.value.error, e.value.detail) == ("invalid_key", "metadata fetch failed")
+    assert "::1" in caplog.text
+
+
+def test_serve_warns_when_connects_can_need_a_confirmation_no_one_can_give(
+        monkeypatch: Any, capsys: Any, tmp_path: Path) -> None:
+    # The example's trusted PS does not connect people on its own, so a connect can wait
+    # on the confirmation page; with no operator token no one can confirm it, and the PS
+    # polls until the code expires. The operator is told at start.
+    import aauth_supervision_server.http_server as hs
+    monkeypatch.setattr(hs, "serve", lambda ss, host, port: FakeHttpd())
+    monkeypatch.delenv("AAUTH_SS_ADMIN_TOKEN", raising=False)
+    key = tmp_path / "k.json"
+    assert cli.main(["keygen", "--kid", "ss-1", "--out", str(key)]) == 0
+    capsys.readouterr()
+    assert cli.main(["serve", "--config", str(EXAMPLES / "server.json"), "--policy",
+                     str(EXAMPLES / "policy.json"), "--key", str(key)]) == 0
+    assert "warning: no operator token" in capsys.readouterr().err
+    monkeypatch.setenv("AAUTH_SS_ADMIN_TOKEN", "operator-secret")
+    assert cli.main(["serve", "--config", str(EXAMPLES / "server.json"), "--policy",
+                     str(EXAMPLES / "policy.json"), "--key", str(key)]) == 0
+    assert "operator token" not in capsys.readouterr().err
+
+
+def test_serve_does_not_warn_of_the_page_when_no_connect_can_need_it(
+        monkeypatch: Any, capsys: Any, tmp_path: Path) -> None:
+    # Every trusted PS connects its people on its own and no stranger is admitted: no
+    # connect ever waits on the confirmation page, so no operator token is needed.
+    import aauth_supervision_server.http_server as hs
+    monkeypatch.setattr(hs, "serve", lambda ss, host, port: FakeHttpd())
+    monkeypatch.delenv("AAUTH_SS_ADMIN_TOKEN", raising=False)
+    cfg = json.loads((EXAMPLES / "server.json").read_text(encoding="utf-8"))
+    cfg["trusted_ps"]["https://ps.example"]["auto_connect"] = True
+    (tmp_path / "server.json").write_text(json.dumps(cfg), encoding="utf-8")
+    key = tmp_path / "k.json"
+    assert cli.main(["keygen", "--kid", "ss-1", "--out", str(key)]) == 0
+    capsys.readouterr()
+    assert cli.main(["serve", "--config", str(tmp_path / "server.json"), "--policy",
+                     str(EXAMPLES / "policy.json"), "--key", str(key)]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_serve_says_it_is_listening_before_it_serves(monkeypatch: Any, tmp_path: Path) -> None:
+    # Under a service manager stdout is a pipe, written in blocks: the line that says the SS
+    # listens reaches the log when it is printed, not when the first request fills the block.
+    import io
+
+    import aauth_supervision_server.http_server as hs
+
+    class Pipe(io.StringIO):
+        flushed = ""
+
+        def flush(self) -> None:
+            self.flushed = self.getvalue()
+
+    out = Pipe()
+    seen: list[str] = []
+
+    class Serving(FakeHttpd):
+        def serve_forever(self) -> None:
+            seen.append(out.flushed)
+            super().serve_forever()
+
+    monkeypatch.setattr(hs, "serve", lambda ss, host, port: Serving())
+    monkeypatch.setattr("sys.stdout", out)
+    monkeypatch.setenv("AAUTH_SS_ADMIN_TOKEN", "operator-secret")
+    key = tmp_path / "k.json"
+    assert cli.main(["keygen", "--kid", "ss-1", "--out", str(key)]) == 0
+    assert cli.main(["serve", "--config", str(EXAMPLES / "server.json"), "--policy",
+                     str(EXAMPLES / "policy.json"), "--key", str(key)]) == 0
+    assert seen and "listening on http://127.0.0.1:8443" in seen[0]

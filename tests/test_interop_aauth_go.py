@@ -1,18 +1,21 @@
-"""Interop with auth-go, the Go AAuth module on aauth.dev.
+"""Interop with aauth-go, the Go AAuth module on aauth.dev.
 
-auth-go (https://github.com/aauth-dev/aauth-go, draft -11 branch, pinned in
-`interop/auth-go/go.mod`) signs and verifies AAuth requests in Go, on yaronf/httpsign,
-sharing nothing with this repository. `interop/auth-go/main.go` is a thin command over
+aauth-go (https://github.com/aauth-dev/aauth-go, v0.2.0, pinned in
+`interop/aauth-go/go.mod`) signs and verifies AAuth requests in Go, on yaronf/httpsign,
+sharing nothing with this repository. `interop/aauth-go/main.go` is a thin command over
 its public API: `ServerSigner.SignRequest`, the signer a PS uses for a request it makes
 in its own right under the `jwks_uri` scheme, and `VerifyServerRequest` with body
 coverage required, as a PS or SS endpoint verifies one.
 
 Three checks, each in both directions where it applies:
 
-* a request auth-go signs as a PS verifies here, with and without a body;
-* a request this code signs verifies with auth-go;
-* a whole mission runs against the unmodified server with every PS request signed by
-  auth-go, including the split exfiltration the APC policy must deny.
+* a request aauth-go signs as a PS verifies here, with and without a body;
+* a request this code signs verifies with aauth-go;
+* two whole missions run against the unmodified server with every PS request signed by
+  aauth-go: one ends in the split exfiltration, which the APC policy denies with the R3
+  proposal forwarded (the opt-in AAuth #256 extension; without it the act is asked), and
+  one, under Supervision -00 as written, catches a prohibited sequence whose tokens are
+  taken last step first.
 
 Go is needed to build the command. Without it these tests skip, unless
 `AAUTH_SS_REQUIRE_GO=1` (set in CI), where a missing toolchain is a failure.
@@ -59,9 +62,9 @@ def authgo(tmp_path_factory: pytest.TempPathFactory) -> Path:
     if go is None:
         if os.environ.get("AAUTH_SS_REQUIRE_GO") == "1":
             pytest.fail("AAUTH_SS_REQUIRE_GO=1 but no Go toolchain is on PATH")
-        pytest.skip("Go toolchain not on PATH (the auth-go interop runs in CI)")
+        pytest.skip("Go toolchain not on PATH (the aauth-go interop runs in CI)")
     exe = tmp_path_factory.mktemp("authgo") / ("authgo-interop" + (".exe" if os.name == "nt" else ""))
-    subprocess.run([go, "build", "-o", str(exe), "."], cwd=ROOT / "interop" / "auth-go",
+    subprocess.run([go, "build", "-o", str(exe), "."], cwd=ROOT / "interop" / "aauth-go",
                    check=True, timeout=600)
     return exe
 
@@ -93,7 +96,7 @@ def test_a_request_signed_by_auth_go_verifies_here(authgo: Path, method: str, pa
                                                    body: bytes) -> None:
     headers = {"Content-Type": "application/json"} if body else {}
     signed = _go_sign(authgo, method, path, headers, body)
-    assert signed["signature-key"] == SK  # auth-go's own jwks_uri serialization
+    assert signed["signature-key"] == SK  # aauth-go's own jwks_uri serialization
     req = HttpRequest(method, "ss.example", path, signed, body)
     signer = verify_request(req, _Resolver(), required=BASE + (BODY_COMPONENTS if body else []),
                             now=time.time())
@@ -118,7 +121,7 @@ def test_a_request_signed_here_verifies_with_auth_go(authgo: Path, method: str, 
 
 def test_auth_go_rejects_a_tampered_request_signed_here(authgo: Path) -> None:
     # Control for the test above: the same request with one byte of the body changed
-    # must fail at auth-go, so a passing verify is not a verifier that accepts anything.
+    # must fail at aauth-go, so a passing verify is not a verifier that accepts anything.
     headers = {"signature-key": SK, "content-type": "application/json",
                "content-digest": content_digest(BODY)}
     req = HttpRequest("POST", "ss.example", "/decision", dict(headers), BODY)
@@ -131,7 +134,7 @@ def test_auth_go_rejects_a_tampered_request_signed_here(authgo: Path) -> None:
 
 
 class _AuthGoPS(SimulatedPS):
-    """The simulated PS, with every request it sends signed by auth-go instead of here."""
+    """The simulated PS, with every request it sends signed by aauth-go instead of here."""
 
     exe: Path
     signed_by_auth_go = 0
@@ -177,6 +180,41 @@ def test_a_mission_runs_with_every_ps_request_signed_by_auth_go(authgo: Path) ->
     assert decide("https://mail.example", {"operations": [{"tool": "send_email"}],
                                            "parameters": {"to": "drop@evil.example"}}) == "deny"
     # connect, mission proposal and approval, two decisions, one issuance: every request
-    # the server accepted was signed by auth-go.
+    # the server accepted was signed by aauth-go.
     assert ps.sent and all(status in (200, 201) for _, _, status in ps.sent)
     assert ps.signed_by_auth_go == len(ps.sent) >= 5
+
+
+def test_tokens_taken_in_reverse_order_are_caught_with_requests_signed_by_auth_go(
+        authgo: Path) -> None:
+    # The shipped example's sequence read_sensitive -> write -> send_internal, with the
+    # tokens taken last step first. Every PS request is signed by aauth-go, including the
+    # `auth_token.issued` events whose `exp` the SS relies on.
+    rec, docs, chat = "https://records.example", "https://docs.example", "https://chat.example"
+    rules = [{"resource": rec, "class": "read_sensitive"},
+             {"resource": docs, "class": "write"},
+             {"resource": chat, "class": "send_internal"}]
+    ps = _AuthGoPS(issuer=PS, key=KEY, transport="current", clock=time.time)
+    ps.exe = authgo
+    fetcher = StaticFetcher()
+    ps.install(fetcher)
+    ss_key = SigningKey.generate("ss-key-1")
+    ss = SupervisionServer(ServerConfig(issuer="https://ss.example",
+                                        trusted_ps={PS: TrustedPS(auto_connect=True)}),
+                           Policy(policy_cfg(rules=rules, prohibited_pairs=[])),
+                           JwksUriResolver(fetcher), ss_key, clock=time.time)
+    ps.ss_jwk = ss_key.public_jwk()
+    s256 = connected((ss, ps, None), resources=(rec, docs, chat))
+
+    def take(resource: str) -> str:
+        sdi, resp, _ = ps.auth_token_request(ss, SUB, AGENT, s256, resource)
+        assert resp.status == 200, resp.body
+        decision: str = resp.json()["decision"]
+        if decision == "allow":
+            assert ps.issued(ss, SUB, AGENT, s256, sdi, resource).status == 201
+        return decision
+
+    assert take(chat) == "allow"
+    assert take(docs) == "allow"
+    assert take(rec) == "deny"
+    assert ps.signed_by_auth_go == len(ps.sent) >= 8

@@ -1,6 +1,6 @@
 """Independent AAuth Supervision Server with a deterministic, composition-aware policy."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # The draft revision this release implements, and the AAuth repository commit the
 # drafts in specs/ are pinned to. A new draft revision means a new release.

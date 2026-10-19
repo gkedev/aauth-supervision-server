@@ -1,7 +1,7 @@
 """The protocol layer is policy-agnostic.
 
 `SupervisionServer` is pure Supervision -00 wire logic. The decision model is a plug:
-anything that satisfies `SupervisionPolicy` (three methods + two attributes) can drive
+anything that satisfies `SupervisionPolicy` (four methods and two attributes) can drive
 it. The APC `Policy` is one such plug; here a deliberately trivial, non-APC policy drives
 the same unmodified server end-to-end through the real signed-request path, proving the
 two are swappable without touching the protocol layer.
@@ -42,6 +42,9 @@ class TrivialPolicy:
     allow: set[str] = field(default_factory=set)
     r3_member: str = "r3_proposal"
     ask_on_mission_update: bool = False
+
+    def serves_on_identity(self, resource: str) -> bool:
+        return False
 
     def classify(self, act: Act) -> Classification:
         cls = "allowed" if act.resource in self.allow else "unlisted"
@@ -148,3 +151,38 @@ def test_apc_policy_still_drives_the_same_server() -> None:
                                      ["https://hr.example"],
                                      [{"name": "WebSearch", "description": "Search"}])
     assert r.status == 200 and s256, r.body
+
+
+@dataclass
+class BareAllow(TrivialPolicy):
+    """Allows a proposal with whatever `narrow` it is given, even none."""
+
+    narrow: dict[str, Any] = field(default_factory=dict)
+
+    def decide_proposal(self, body: dict[str, Any], now: float | None = None) -> Decision:
+        return Decision("allow", narrow=dict(self.narrow))
+
+
+def _propose(policy: SupervisionPolicy) -> dict[str, Any]:
+    ss, ps, clock = make_env_with(policy)
+    assert ps.connect(ss, SUB).status == 200
+    r = ps.call(ss, "POST", "/mission", {"sdi": "d-p1", "iat": int(clock()), "sub": SUB,
+                                         "agent": AGENT, "agent_token": ps.agent_token(AGENT),
+                                         "description": "# As proposed", "resources": [],
+                                         "tools": []})
+    assert r.status == 200
+    return dict(r.json())
+
+
+def test_an_allow_without_a_description_carries_the_proposal_s() -> None:
+    # Supervision L415: `description` is REQUIRED in an allow; the policy refined nothing.
+    assert _propose(BareAllow()) == {"sdi": "d-p1", "decision": "allow",
+                                     "description": "# As proposed"}
+    assert _propose(BareAllow(narrow={"description": 7}))["description"] == "# As proposed"
+    assert _propose(BareAllow(narrow={"description": "# Refined"}))["description"] == "# Refined"
+
+
+def test_a_policy_s_narrowing_cannot_rewrite_the_answer_s_sdi_or_decision() -> None:
+    body = _propose(BareAllow(narrow={"sdi": "d-other", "decision": "deny",
+                                      "approved_tools": []}))
+    assert (body["sdi"], body["decision"], body["approved_tools"]) == ("d-p1", "allow", [])

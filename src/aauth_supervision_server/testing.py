@@ -1,9 +1,9 @@
 """A simulated Person Server that speaks Supervision -00 to an SS.
 
 Used by the tests and the adversarial suite. It signs as a server under the
-`jwks_uri` scheme, mints the forwarded tokens (agent, person, resource, auth) as
-real signed JWTs, assembles mission blobs, and sends events and replays exactly
-as the draft describes. It can also forward the R3 per-call proposal the way
+`jwks_uri` scheme, mints the forwarded tokens (agent, person, resource) as real
+signed JWTs, assembles mission blobs, and sends events; `replay_to` resends what it
+sent, in order. It can also forward the R3 per-call proposal the way
 AAuth #256 proposes (`transport="forwarded"`).
 """
 
@@ -52,6 +52,8 @@ class SimulatedPS:
     ss_jwk: dict[str, Any] | None = None
     _ids: Any = field(default_factory=lambda: itertools.count(1))
     sent: list[tuple[str, dict[str, Any], int]] = field(default_factory=list)
+    # The `exp` each allow carried, by sdi: the PS applies it to the token (Supervision L508).
+    allowed_exp: dict[str, int] = field(default_factory=dict)
 
     def documents(self) -> dict[str, Any]:
         return {
@@ -188,6 +190,12 @@ class SimulatedPS:
         if self.transport.startswith("forwarded") and member is not None:
             body["r3_proposal"] = member
         resp = self.call(server, "POST", "/decision", body)
+        if resp.status == 200:
+            answer = resp.json()
+            assert isinstance(answer, dict)
+            exp = answer.get("exp")
+            if isinstance(exp, int) and answer.get("decision") == "allow":
+                self.allowed_exp[sdi] = exp
         return sdi, resp, (proposal if self.transport.startswith("forwarded") else None)
 
     def issued(self, server: Any, sub: str, agent: str, mission_s256: str, sdi: str,
@@ -197,7 +205,9 @@ class SimulatedPS:
                                 "iat": int(self.clock()), "sub": sub, "agent": agent,
                                 "jti": jti or self.nid("at"), "aud": resource,
                                 "scope": scope or None,
-                                "exp": int(self.clock()) + 3600, "issuer": self.issuer}
+                                "exp": min(int(self.clock()) + 3600,
+                                           self.allowed_exp.get(sdi, 2**62)),
+                                "issuer": self.issuer}
         if mission_s256:
             body["mission_s256"] = mission_s256
         if self.transport == "forwarded+issued" and proposal is not None:

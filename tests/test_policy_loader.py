@@ -48,13 +48,13 @@ REJECT: list[tuple[dict[str, Any], str]] = [
     ({"rules": [RULE | {"param_domain_not_in": ["to"]}]},
      "rules[0].param_domain_not_in: must map parameter names to arrays of domains"),
     ({"rules": [RULE | {"param_gt": {}}]},
-     "rules[0].param_gt: must map parameter names to numbers"),
+     "rules[0].param_gt: must map parameter names to finite numbers"),
     ({"rules": [RULE | {"param_gt": {"amount": "100"}}]},
-     "rules[0].param_gt: must map parameter names to numbers"),
+     "rules[0].param_gt: must map parameter names to finite numbers"),
     ({"rules": [RULE | {"param_gt": {"amount": True}}]},
-     "rules[0].param_gt: must map parameter names to numbers"),
+     "rules[0].param_gt: must map parameter names to finite numbers"),
     ({"rules": [RULE | {"param_gt": [100]}]},
-     "rules[0].param_gt: must map parameter names to numbers"),
+     "rules[0].param_gt: must map parameter names to finite numbers"),
     ({"rules": [RULE | {"clas": "x"}]}, "rules[0].clas: unknown member"),
     ({"prohibited_pairs": "a,b"}, "prohibited_pairs: must be an array of arrays of class names"),
     ({"prohibited_pairs": [["a", 1]]},
@@ -64,8 +64,8 @@ REJECT: list[tuple[dict[str, Any], str]] = [
     ({"prohibited_pairs": [["a"]]}, "prohibited_pairs: each entry must name exactly 2 classes"),
     ({"prohibited_sequences": [["a"], "b"]},
      "prohibited_sequences: must be an array of arrays of class names"),
-    # Regression: an empty or one-class sequence used to load and then raise IndexError
-    # on every decision (found by mutation-testing follow-up, 2026-10-07).
+    # An empty or one-class sequence would load and then raise IndexError on every
+    # decision.
     ({"prohibited_sequences": [[]]}, "prohibited_sequences: each entry must name at least 2"),
     ({"prohibited_sequences": [["a", "b"], ["c"]]},
      "prohibited_sequences: each entry must name at least 2"),
@@ -81,6 +81,54 @@ REJECT: list[tuple[dict[str, Any], str]] = [
     ({"high_imapct": []}, "high_imapct: unknown member"),
     ({"r3_member": ""}, "r3_member: must be a non-empty string or null"),
     ({"r3_member": 5}, "r3_member: must be a non-empty string or null"),
+    # Entries that can never match a resource: identifiers are a lowercase https host
+    # and nothing else (Protocol L1948-L1969), and patterns compare case-sensitively.
+    ({"deny_resources": ["https://exfil.example/"]}, "deny_resources[0]: can never match"),
+    ({"deny_resources": ["https://x.example", "HTTPS://EXFIL.EXAMPLE"]},
+     "deny_resources[1]: can never match"),
+    ({"deny_resources": ["exfil.example"]}, "deny_resources[0]: can never match"),
+    ({"deny_resources": ["https://exfil.example:443"]}, "deny_resources[0]: can never match"),
+    ({"deny_resources": ["http://exfil.example"]}, "deny_resources[0]: can never match"),
+    ({"deny_resources": ["https://exfil.example/*"]}, "deny_resources[0]: can never match"),
+    ({"deny_resources": ["https://*.EXAMPLE"]}, "deny_resources[0]: can never match"),
+    ({"serves_on_identity": ["https://Records.example"]},
+     "serves_on_identity[0]: can never match"),
+    ({"rules": [RULE | {"resource": "https://mail.example/"}]},
+     "rules[0].resource: can never match"),
+    ({"rules": [RULE | {"param_gt": {"amount": float("nan")}}]},
+     "rules[0].param_gt: must map parameter names to finite numbers"),
+    ({"rules": [RULE | {"param_gt": {"amount": float("inf")}}]},
+     "rules[0].param_gt: must map parameter names to finite numbers"),
+    ({"rules": [RULE | {"param_gt": {"amount": float("-inf")}}]},
+     "rules[0].param_gt: must map parameter names to finite numbers"),
+    # An integer past the float range is no number the SS can compare a value with.
+    ({"rules": [RULE | {"param_gt": {"amount": 10 ** 400}}]},
+     "rules[0].param_gt: must map parameter names to finite numbers"),
+    # Values that load and then fail every decision that reads them.
+    ({"max_mission_seconds": 10 ** 20}, "max_mission_seconds: must be a positive integer"),
+    ({"resource_budgets": {"https://pay.example": {"unit": "USD", "decimals": 19,
+                                                   "max_amount": 100}}},
+     "resource_budgets.https://pay.example.decimals: must be an integer from 0 to 18"),
+    ({"resource_budgets": {"https://pay.example": {"unit": "USD", "decimals": 2,
+                                                   "max_amount": 10 ** 15}}},
+     "resource_budgets.https://pay.example.max_amount: must be a non-negative integer of "
+     "at most 15 digits"),
+    # Patterns that load but can match no identifier: a label that starts or ends with a
+    # hyphen, an empty label, an unclosed bracket, a class without the `h` of `https`.
+    ({"deny_resources": ["https://exfil.example["]}, "deny_resources[0]: can never match"),
+    ({"deny_resources": ["https://-exfil.example*"]}, "deny_resources[0]: can never match"),
+    ({"deny_resources": ["https://exfil..example*"]}, "deny_resources[0]: can never match"),
+    ({"deny_resources": ["[!h]*"]}, "deny_resources[0]: can never match"),
+    ({"deny_resources": ["https://*-"]}, "deny_resources[0]: can never match"),
+    ({"rules": [RULE | {"resource": "https://*.-x"}]}, "rules[0].resource: can never match"),
+    # However many wildcards a pattern has, one that can match nothing is refused.
+    ({"deny_resources": ["https://*.*.*.*.*.*.*_"]}, "deny_resources[0]: can never match"),
+    ({"deny_resources": ["https://*.*.*.*.*.*.*.EXAMPLE"]}, "deny_resources[0]: can never match"),
+    ({"deny_resources": ["HTTPS://?**?[a-s][a-z]"]}, "deny_resources[0]: can never match"),
+    ({"deny_resources": ["https://exfil.example/*/*/*/*/*/*/*"]},
+     "deny_resources[0]: can never match"),
+    # A label is at most 63 characters (RFC 1035 Section 2.3.4), whatever follows it.
+    ({"deny_resources": ["https://" + "a" * 64 + "*"]}, "deny_resources[0]: can never match"),
 ]
 
 
@@ -133,3 +181,32 @@ def test_rank_orders_by_severity_and_unknown_is_below_all() -> None:
     assert [cfg.rank(c) for c in ("read", "write", "send")] == [0, 1, 2]
     assert cfg.rank("nope") == -1
     assert cfg.rank("nope") < cfg.rank("read")
+
+
+@pytest.mark.parametrize("pattern", ["*", "https://mail.example", "https://*.example",
+                                     "*.example", "https://mail.ex?mple", "https://[a-m]*",
+                                     "https://xn--bcher-kva.example", "https://a.*.example",
+                                     "https://*-*.example", "https://x*", "https://*.*",
+                                     "https://???.example", "*mail*", "[h]ttps://*",
+                                     "https://*?*?*?*?*?*", "https://[!]]x.example",
+                                     "https://[]a]x.example", "http*", "https*", "https:*",
+                                     "*://x.example", "h*.example", "http[a-z]://x.example",
+                                     "https://*-*-*-*-*-*-*-*-*-*-x"])
+def test_a_resource_pattern_that_can_match_is_accepted(pattern: str) -> None:
+    cfg = PolicyConfig.from_dict({"deny_resources": [pattern], "serves_on_identity": [pattern],
+                                  "rules": [RULE | {"resource": pattern}]})
+    assert cfg.deny_resources == [pattern] and cfg.rules[0].resource == pattern
+
+
+def test_a_rule_for_acts_without_a_resource_is_accepted() -> None:
+    # An empty `resource` matches the acts that have none (a tool's permission).
+    assert PolicyConfig.from_dict({"rules": [RULE | {"resource": ""}]}).rules[0].resource == ""
+
+
+def test_the_bounds_are_accepted_at_their_limit() -> None:
+    from aauth_supervision_server.policy import MAX_AMOUNT, MAX_DECIMALS, MAX_MISSION_SECONDS
+    cfg = PolicyConfig.from_dict({
+        "max_mission_seconds": MAX_MISSION_SECONDS,
+        "resource_budgets": {"https://pay.example": {"unit": "USD", "decimals": MAX_DECIMALS,
+                                                     "max_amount": MAX_AMOUNT}}})
+    assert cfg.max_mission_seconds == MAX_MISSION_SECONDS

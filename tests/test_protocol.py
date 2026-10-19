@@ -17,7 +17,8 @@ def _first_decision(ps, sdi):
     return next(b for p, b, _ in ps.sent if p == "/decision" and b.get("sdi") == sdi)
 
 
-@pytest.mark.req("SUP-001", "SUP-002", "SUP-003", "SUP-004", "SUP-005", "SUP-006", "SUP-007", "SUP-008")
+@pytest.mark.req("SUP-001", "SUP-002", "SUP-003", "SUP-004", "SUP-005", "SUP-006", "SUP-007", "SUP-008",
+                 "VER-026", "REF-023")
 def test_metadata_and_jwks(env):  # SUP metadata rows
     ss, _, _ = env
     md = ss.handle(HttpRequest("GET", "ss.example", "/.well-known/aauth-supervisor.json")).json()
@@ -208,7 +209,7 @@ def test_event_dedup(env):
             "agent_iss": "https://agent.example", "agent_sub": AGENT}
     assert ps.call(ss, "POST", "/event", body).status == 201
     assert ps.call(ss, "POST", "/event", body).status == 201
-    assert len(ss.store.agents) == 1 and ss.handle  # nothing recorded twice
+    assert len(ss.store.agents) == 1  # nothing recorded twice
 
 
 @pytest.mark.req("SUP-P09")
@@ -239,7 +240,7 @@ def test_person_token_act(env):
         == "ask"
 
 
-@pytest.mark.req("SUP-027", "SUP-048", "SUP-P03", "SUP-P04", "SUP-P05")
+@pytest.mark.req("SUP-027", "SUP-048", "SUP-P03", "SUP-P04", "SUP-P05", "REF-054", "REF-055")
 def test_clarify_flow():
     ss, ps, clock = make_env(clarify_missing_justification=True)
     s256 = connected((ss, ps, clock))
@@ -259,14 +260,15 @@ def test_clarify_flow():
                                     "clarification_response": "Weekly status to my team."})
     assert ans.status == 200 and ans.json()["decision"] == "ask"
     assert "the agent says" in ans.json()["summary"]
-    assert ps.call(ss, "GET", loc).json()["decision"] == "ask"
-    # the decision endpoint replays the same terminal answer for the sdi
-    again = ps.call(ss, "POST", "/decision", ps.sent[0][1] if False else _first_decision(ps, sdi),
+    # Protocol L2840: once the terminal answer is returned the pending URL is gone ...
+    assert ps.call(ss, "GET", loc).status == 410
+    # ... and the decision endpoint replays the same terminal answer for the sdi (L316)
+    again = ps.call(ss, "POST", "/decision", _first_decision(ps, sdi),
                     verify=False)
     assert again.body == ans.body
 
 
-@pytest.mark.req("SUP-P05")
+@pytest.mark.req("SUP-P05", "REF-010")
 def test_clarify_cancel():
     ss, ps, clock = make_env(clarify_missing_justification=True)
     s256 = connected((ss, ps, clock))

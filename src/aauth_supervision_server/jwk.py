@@ -17,7 +17,15 @@ from cryptography.hazmat.primitives.asymmetric.utils import (
 from .errors import SignatureError
 
 SUPPORTED_ALGS = ("Ed25519", "ES256")
+# Signature-Key 4.2: a List of Tokens, each the JOSE identifier verbatim (not quoted Strings).
+_ACCEPT_ALGS = ", ".join(SUPPORTED_ALGS)
 _PROHIBITED = {"none", "EdDSA", "HS256", "HS384", "HS512"}
+# Ed25519: the field prime (RFC 8032 5.1), and the y-coordinates of the points of small
+# order, whose eighth multiple is the identity. Under such a public key anyone can make a
+# signature that verifies, so it binds no signer.
+_P25519 = 2 ** 255 - 19
+_Y8 = 0x7A03AC9277FDC74EC6CC392CFA53202A0F67100D760B3CBA4FD84D3D706A17C7
+_SMALL_ORDER_Y = frozenset({0, 1, _P25519 - 1, _Y8, _P25519 - _Y8})
 
 
 def b64u(data: bytes) -> str:
@@ -61,25 +69,38 @@ def key_from_jwk(jwk: dict[str, Any]) -> VerifyKey:
     if not isinstance(jwk, dict):
         raise SignatureError("invalid_key", "JWK is not an object")
     alg = jwk.get("alg")
+    if not isinstance(alg, str):
+        alg = None  # absent, or not a name: no algorithm is determined
     if not alg or alg in _PROHIBITED or jwk.get("kty") == "oct":
         raise SignatureError(
             "unsupported_algorithm", f"alg {alg!r} absent, polymorphic or prohibited",
-            {"Accept-Signature-Alg": ", ".join(f'"{a}"' for a in SUPPORTED_ALGS)})
+            {"Accept-Signature-Alg": _ACCEPT_ALGS})
     if alg not in SUPPORTED_ALGS:
         raise SignatureError(
             "unsupported_algorithm", f"alg {alg} not implemented",
-            {"Accept-Signature-Alg": ", ".join(f'"{a}"' for a in SUPPORTED_ALGS)})
+            {"Accept-Signature-Alg": _ACCEPT_ALGS})
     try:
         if alg == "Ed25519":
             if jwk.get("kty") != "OKP" or jwk.get("crv") != "Ed25519":
                 raise SignatureError("invalid_key", "kty/crv disagree with alg Ed25519")
-            if len(b64u_decode(jwk["x"])) != 32:
+            raw = b64u_decode(jwk["x"])
+            if len(raw) != 32:
                 raise SignatureError("invalid_key", "bad Ed25519 x")
+            y = int.from_bytes(raw, "little") & ((1 << 255) - 1)
+            if y >= _P25519:  # RFC 8032 5.1.3: "decoding fails"
+                raise SignatureError("invalid_key", "Ed25519 x is not canonically encoded")
+            if y in _SMALL_ORDER_Y:
+                raise SignatureError("invalid_key", "Ed25519 x is a point of small order")
         else:
             if jwk.get("kty") != "EC" or jwk.get("crv") != "P-256":
                 raise SignatureError("invalid_key", "kty/crv disagree with alg ES256")
-            b64u_decode(jwk["x"])
-            b64u_decode(jwk["y"])
+            cx, cy = b64u_decode(jwk["x"]), b64u_decode(jwk["y"])
+            if len(cx) != 32 or len(cy) != 32:
+                # RFC 7518 6.2.1.2, 6.2.1.3: "the full size of a coordinate for the curve".
+                raise SignatureError("invalid_key", "ES256 x and y are 32 octets each")
+            # A point off the curve is refused here (ValueError), not at each verification.
+            ec.EllipticCurvePublicNumbers(int.from_bytes(cx, "big"), int.from_bytes(cy, "big"),
+                                          ec.SECP256R1()).public_key()
     except (KeyError, ValueError) as e:
         raise SignatureError("invalid_key", f"malformed JWK: {e}") from e
     if "d" in jwk:
@@ -91,6 +112,11 @@ class SigningKey:
     """A private signing key with its public JWK."""
 
     def __init__(self, alg: str, kid: str, private: Any) -> None:
+        # Signature-Key carries the kid as a Structured Field String (RFC 9651 3.3.3):
+        # printable ASCII only. Any other could never be sent, and nothing signed with
+        # this key would verify.
+        if not isinstance(kid, str) or not kid or any(not 0x20 <= ord(c) <= 0x7E for c in kid):
+            raise ValueError(f"kid must be printable ASCII: {kid!r}")
         self.alg = alg
         self.kid = kid
         self._priv = private

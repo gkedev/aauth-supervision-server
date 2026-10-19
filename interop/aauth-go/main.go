@@ -1,5 +1,5 @@
 // Command authgo-interop signs and verifies server-signed AAuth requests with
-// auth-go (github.com/aauth-dev/auth-go, the Go AAuth module on aauth.dev), so
+// aauth-go (github.com/aauth-dev/aauth-go v0.2.0, the Go AAuth module on aauth.dev), so
 // the Python test suite can check this Supervision Server against an
 // independent implementation in another language.
 //
@@ -28,7 +28,7 @@ import (
 	"os"
 	"strings"
 
-	aauth "github.com/aauth-dev/auth-go"
+	aauth "github.com/aauth-dev/aauth-go"
 )
 
 type input struct {

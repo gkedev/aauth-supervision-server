@@ -1,4 +1,4 @@
-"""APC policy behaviour, end to end through the SS (rows: CORE-003/004, SUP-052..060, SUP-P11)."""
+"""APC policy behaviour, end to end through the SS (rows: SUP-052..060, SUP-P11)."""
 
 from __future__ import annotations
 
@@ -34,7 +34,6 @@ def _issue(ss, ps, s256, resource, proposal=None, scope="", justification=""):
 # ------------------------------------------------------------------ provenance
 
 
-@pytest.mark.req("CORE-003", "CORE-004")
 def test_agent_asserted_data_cannot_lower_the_class():
     p = Policy(policy_cfg())
     internal = "colleague@corp.example"
@@ -45,7 +44,6 @@ def test_agent_asserted_data_cannot_lower_the_class():
     assert c.cls == "send_external" and c.provenance == "agent" and c.uncertain
 
 
-@pytest.mark.req("CORE-003")
 def test_agent_asserted_data_can_raise_the_class():
     p = Policy(policy_cfg())
     c = p.classify(Act("permission", "https://ps.example", SUB, AGENT, tool="SendEmail",
@@ -53,7 +51,6 @@ def test_agent_asserted_data_can_raise_the_class():
     assert c.cls == "send_external"
 
 
-@pytest.mark.req("CORE-004")
 def test_justification_never_turns_an_ask_into_allow():
     ss, ps, clock = make_env()
     s256 = connected((ss, ps, clock), resources=RES)
@@ -62,7 +59,7 @@ def test_justification_never_turns_an_ask_into_allow():
     assert d["decision"] == "ask" and "the agent says" in d["summary"]
 
 
-@pytest.mark.req("CORE-003", "R3-006")
+@pytest.mark.req("R3-006")
 def test_resource_asserted_proposal_decides_when_forwarded():
     ss, ps, clock = make_env(transport="forwarded")
     s256 = connected((ss, ps, clock), resources=RES)
@@ -90,7 +87,7 @@ def test_released_sensitive_result_blocks_external_send():
     hist = ss.store.missions[f"{ps.issuer}|{s256}"].history
     assert hist[-1].action_class == "read_sensitive" and hist[-1].provenance == "resource"
     _, d = _issue(ss, ps, s256, MAIL, SEND | {"parameters": {"to": "a@evil.example"}})
-    assert d["decision"] == "deny" and "read_sensitive then send_external" in d["reason"]
+    assert d["decision"] == "deny" and "`read_sensitive`, then `send_external`" in d["reason"]
 
 
 def test_composition_on_uncertain_evidence_asks_not_denies():
@@ -102,7 +99,7 @@ def test_composition_on_uncertain_evidence_asks_not_denies():
     assert hist[-1].action_class == "read_sensitive" and hist[-1].detail.startswith("uncertain")
     _, d = _issue(ss, ps, s256, MAIL, scope="mail.send")
     assert d["decision"] == "ask" and d["recommendation"] == "deny"
-    assert "cannot rule it out" in d["summary"]
+    assert "neither confirm nor rule it out" in d["summary"]
 
 
 def test_prohibited_sequence():
@@ -115,7 +112,7 @@ def test_prohibited_sequence():
     _, d = _issue(ss, ps, s256, CAL)
     assert d["decision"] == "allow"
     _, d = _issue(ss, ps, s256, MAIL, SEND | {"parameters": {"to": "a@corp.example"}})
-    assert d["decision"] == "deny" and "read_sensitive then write then send_internal" in d["reason"]
+    assert d["decision"] == "deny" and "`read_sensitive`, then `write`, then `send_internal`" in d["reason"]
 
 
 # ------------------------------------------------------------------ budgets
@@ -141,6 +138,15 @@ def test_budget_amount_unknown_asks():
     s256 = connected((ss, ps, clock), resources=RES)
     _, d = _issue(ss, ps, s256, PAY)
     assert d["decision"] == "ask" and "cannot be checked" in d["summary"]
+
+
+def test_a_class_budget_is_named_by_its_class_then_its_amount():
+    # A class budget has no unit of its own: the person reads whose budget it is and
+    # its amount, never a bare number ("the 500000 budget").
+    ss, ps, clock = make_env()
+    s256 = connected((ss, ps, clock), resources=RES)
+    _, d = _issue(ss, ps, s256, PAY)
+    assert "so the `payment` budget of 500000 cannot be checked" in d["summary"]
 
 
 # ------------------------------------------------------------------ reach
@@ -187,7 +193,7 @@ def test_reach_given_for_a_composition_overrides_only_that_composition():
     sdi, d = _issue(ss, ps, s256, MAIL, scope="mail.send")
     assert d["decision"] == "ask"
     labels = [o["label"] for o in d["apply_options"]]
-    assert any("read_sensitive then send_external" in lbl for lbl in labels)
+    assert any("`read_sensitive`, then `send_external`" in lbl for lbl in labels)
     ps.resolved(ss, SUB, AGENT, s256, sdi, "allow", "mission")
     ps.issued(ss, SUB, AGENT, s256, sdi, MAIL, "mail.send")
     assert _issue(ss, ps, s256, MAIL, scope="mail.send")[1]["decision"] == "allow"
